@@ -1,6 +1,9 @@
 .gradle/
 build/
+.cxx/
 local.properties
 .idea/
 *.iml
 .DS_Store
+# Lo descarga el workflow de GitHub Actions
+app/src/main/cpp/rubberband/

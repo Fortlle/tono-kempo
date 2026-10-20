@@ -8,10 +8,13 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.provider.OpenableColumns
+import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.LinearLayout
+import android.widget.RadioButton
+import android.widget.RadioGroup
 import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
@@ -40,6 +43,8 @@ class MainActivity : Activity() {
     private lateinit var txtFile: TextView
     private lateinit var txtTone: TextView
     private lateinit var seekTone: SeekBar
+    private lateinit var radioRb: RadioButton
+    private lateinit var radioKempo: RadioButton
     private lateinit var checkFormant: CheckBox
     private lateinit var btnPlay: Button
     private lateinit var btnPause: Button
@@ -121,6 +126,23 @@ class MainActivity : Activity() {
         root.addView(seekTone, lp)
         updateToneLabel()
 
+        root.addView(TextView(this).apply { text = "Motor de audio"; typeface = Typeface.DEFAULT_BOLD }, lp)
+        radioRb = RadioButton(this).apply {
+            id = View.generateViewId()
+            text = "Rubber Band R3 (más calidad, más lento)"
+        }
+        radioKempo = RadioButton(this).apply {
+            id = View.generateViewId()
+            text = "Kempo (más rápido)"
+        }
+        val group = RadioGroup(this).apply {
+            orientation = RadioGroup.VERTICAL
+            addView(radioRb)
+            addView(radioKempo)
+            check(radioRb.id)
+        }
+        root.addView(group, lp)
+
         checkFormant = CheckBox(this).apply { text = "Mover el timbre (formantes) junto con el tono" }
         root.addView(checkFormant, lp)
 
@@ -187,6 +209,8 @@ class MainActivity : Activity() {
     }
 
     private fun semitones(): Float = (seekTone.progress - TONE_CENTER) / 2f
+
+    private fun engine(): Engine = if (radioRb.isChecked) Engine.RUBBERBAND else Engine.KEMPO
 
     private fun refreshButtons() {
         val loaded = audio != null
@@ -300,14 +324,15 @@ class MainActivity : Activity() {
         }
     }
 
-    // ---------- Procesamiento con Kempo ----------
+    // ---------- Procesamiento ----------
 
     /** Procesa con los ajustes actuales (o reutiliza el resultado en caché) y entrega el PCM. */
     private fun process(then: (ByteArray) -> Unit) {
         val a = audio ?: return
         val st = semitones()
         val fm = checkFormant.isChecked
-        val key = "$st|$fm"
+        val eng = engine()
+        val key = "$st|$fm|$eng"
 
         val cached = cachePcm
         if (key == cacheKey && cached != null) {
@@ -315,10 +340,13 @@ class MainActivity : Activity() {
             return
         }
 
-        setBusy(true, "Procesando con Kempo… puede tardar según la duración")
+        val engineName = if (eng == Engine.RUBBERBAND) "Rubber Band" else "Kempo"
+        setBusy(true, "Procesando con $engineName…")
         Thread {
             try {
-                val out = PitchProcessor.shift(a, st, fm)
+                val out = PitchProcessor.shift(a, st, fm, eng) { p ->
+                    ui.post { txtStatus.text = "Procesando con $engineName… ${(p * 100).toInt()}%" }
+                }
                 ui.post {
                     cacheKey = key
                     cachePcm = out
