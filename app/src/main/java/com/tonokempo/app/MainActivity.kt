@@ -276,11 +276,11 @@ class MainActivity : Activity() {
         val halfLp = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         editStart = EditText(this).apply {
             hint = "Inicio (ej. 1:20)"
-            inputType = InputType.TYPE_CLASS_DATETIME or InputType.TYPE_DATETIME_VARIANT_TIME
+            inputType = InputType.TYPE_CLASS_DATETIME or InputType.TYPE_DATETIME_VARIATION_TIME
         }
         editEnd = EditText(this).apply {
             hint = "Fin (ej. 3:04)"
-            inputType = InputType.TYPE_CLASS_DATETIME or InputType.TYPE_DATETIME_VARIANT_TIME
+            inputType = InputType.TYPE_CLASS_DATETIME or InputType.TYPE_DATETIME_VARIATION_TIME
         }
         rangeRow.addView(editStart, halfLp)
         rangeRow.addView(editEnd, halfLp)
