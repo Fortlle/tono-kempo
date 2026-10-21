@@ -435,6 +435,7 @@ class MainActivity : AppCompatActivity() {
             clickPanel.addView(text("Compás", MR.style.TextAppearance_Material3_LabelLarge), lp(14))
             clickPanel.addView(toggle(listOf("Auto", "2", "3", "4", "6"), 0) { idx ->
                 barChoice = intArrayOf(0, 2, 3, 4, 6)[idx]
+                redecodeBeats()
             }, lp(6))
 
             clickPanel.addView(text("Si el acento (el clic más agudo) cae en el golpe equivocado, muévelo", MR.style.TextAppearance_Material3_LabelLarge), lp(14))
@@ -815,7 +816,7 @@ class MainActivity : AppCompatActivity() {
                         ui.post { setStatus("Descargando modelo de tempo… ${(p * 100).toInt()}%", p) }
                     }
                 }
-                val an = BeatTracker.analyze(ctx, a, cancelFlag) { p ->
+                val an = BeatTracker.analyze(ctx, a, meters(), cancelFlag) { p ->
                     ui.post { setStatus("Detectando tempo… ${(p * 100).toInt()}%", p) }
                 }
                 ui.post {
@@ -825,11 +826,7 @@ class MainActivity : AppCompatActivity() {
                         switchClick.isChecked = false
                         setBusy(false, "Sin resultado de tempo")
                     } else {
-                        txtTempo.text = String.format(
-                            Locale.getDefault(),
-                            "Tempo detectado: %.1f BPM, compás de %d tiempos",
-                            an.bpm, an.beatsPerBar
-                        )
+                        txtTempo.text = tempoText(an)
                         setBpm(an.bpm)
                         setBusy(false, "Tempo detectado")
                     }
@@ -851,21 +848,50 @@ class MainActivity : AppCompatActivity() {
         }.start()
     }
 
+    private fun meters(): IntArray = if (barChoice == 0) intArrayOf(3, 4) else intArrayOf(barChoice)
+
+    private fun tempoText(an: BeatAnalysis): String = String.format(
+        Locale.getDefault(),
+        "Tempo detectado: %.1f BPM, compás de %d tiempos",
+        an.bpm, an.meter
+    )
+
+    /** Vuelve a calcular compases con los tiempos por compás elegidos (sin repetir el modelo). */
+    private fun redecodeBeats() {
+        val an = beatAnalysis ?: return
+        if (busy) return
+        setBusy(true, "Recalculando compás…")
+        Thread {
+            try {
+                val re = BeatTracker.decode(an.beatProb, an.downProb, meters())
+                ui.post {
+                    beatAnalysis = re
+                    accentShift = 0
+                    txtShift.text = "0"
+                    txtTempo.text = tempoText(re)
+                    setBusy(false, "Compás actualizado")
+                    updateClickPanel()
+                }
+            } catch (e: Throwable) {
+                ui.post { setBusy(false, "Error al recalcular: ${e.message ?: e.javaClass.simpleName}") }
+            }
+        }.start()
+    }
+
     private fun buildClick(a: DecodedAudio): ClickSpec? {
         if (!switchClick.isChecked) return null
         val an = beatAnalysis ?: return null
         val n = an.beats.size
         if (n == 0) return null
         val gain = sliderClick.value / 100f
-        val barSize: Int? = if (barChoice == 0) null else barChoice
-        val firstDown = an.isDown.indexOfFirst { it }.let { if (it < 0) 0 else it }
+        val meter = an.meter
 
         val bpm = currentBpm()
         if (clickFixed && bpm != null && bpm in 30.0..300.0) {
-            // Pulso parejo, con la fase del primer primer-tiempo detectado
+            // Pulso parejo, con la fase del primer "primer tiempo" detectado
             val step = 60.0 / bpm
+            val firstDown = an.beatInBar.indexOfFirst { it == 1 }.let { if (it < 0) 0 else it }
             val t0 = an.beats[firstDown]
-            val bar = barSize ?: an.beatsPerBar
             val duration = a.durationMs / 1000.0
             val times = ArrayList<Double>()
             val accent = ArrayList<Boolean>()
@@ -875,23 +901,15 @@ class MainActivity : AppCompatActivity() {
                 if (t >= duration) break
                 if (t >= 0.0) {
                     times.add(t)
-                    accent.add(Math.floorMod(k - accentShift, bar) == 0)
+                    accent.add(Math.floorMod(k - accentShift, meter) == 0)
                 }
                 k++
             }
             return ClickSpec(times.toDoubleArray(), accent.toBooleanArray(), gain)
         }
 
-        // Sigue los golpes detectados
-        val accent = BooleanArray(n)
-        for (i in 0 until n) {
-            accent[i] = if (barSize == null) {
-                val j = i - accentShift
-                j in 0 until n && an.isDown[j]
-            } else {
-                Math.floorMod(i - firstDown - accentShift, barSize) == 0
-            }
-        }
+        // Sigue los golpes detectados; el acento va en el golpe 1 de cada compás (movible con ◀ ▶)
+        val accent = BooleanArray(n) { i -> Math.floorMod(an.beatInBar[i] - 1 - accentShift, meter) == 0 }
         return ClickSpec(an.beats, accent, gain)
     }
 

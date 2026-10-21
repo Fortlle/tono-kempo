@@ -11,21 +11,27 @@ import java.nio.ByteOrder
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
 import kotlin.math.ceil
+import kotlin.math.exp
 import kotlin.math.min
 
-/** Golpes (beats) en segundos, cuáles son primer tiempo de compás, tempo y tiempos por compás. */
+/**
+ * Resultado de la detección: tiempos de cada golpe (segundos), número de cada golpe dentro del compás
+ * (1 = primer tiempo), tempo, tiempos por compás y las probabilidades del modelo (para recalcular).
+ */
 class BeatAnalysis(
     val beats: DoubleArray,
-    val isDown: BooleanArray,
+    val beatInBar: IntArray,
     val bpm: Double,
-    val beatsPerBar: Int
+    val meter: Int,
+    val beatProb: FloatArray,
+    val downProb: FloatArray
 )
 
 /**
  * Detección de tempo y golpes con Beat This! (CPJKU, ISMIR 2024, licencia MIT) en formato ONNX.
- * El modelo recibe un espectrograma log-mel y devuelve probabilidades (logits) de golpe y de
- * primer tiempo para cada frame de 20 ms. Aquí se hace el troceado y la selección de picos
- * ("minimal postprocessing" del proyecto original).
+ * El modelo recibe un espectrograma log-mel y devuelve logits de golpe y de primer tiempo para cada
+ * frame de 20 ms. Después se usa un seguimiento con tempo restringido (DbnTracker) para obtener
+ * golpes regulares y compases coherentes.
  */
 object BeatTracker {
     private const val CHUNK = 1500
@@ -56,6 +62,7 @@ object BeatTracker {
     fun analyze(
         context: Context,
         audio: DecodedAudio,
+        meters: IntArray,
         cancel: AtomicBoolean,
         onProgress: (Float) -> Unit
     ): BeatAnalysis {
@@ -117,39 +124,37 @@ object BeatTracker {
             try { opts.close() } catch (_: Exception) {}
         }
 
-        val beatFrames = pickPeaks(beatLogits)
-        val downFrames = pickPeaks(downLogits)
-        val beats = DoubleArray(beatFrames.size) { beatFrames[it] / FPS }
-        val downTimes = DoubleArray(downFrames.size) { downFrames[it] / FPS }
-
-        // Los primeros tiempos de compás se ajustan al golpe más cercano
-        val isDown = BooleanArray(beats.size)
-        for (t in downTimes) {
-            var best = -1
-            var bestDist = Double.MAX_VALUE
-            for (i in beats.indices) {
-                val dist = abs(beats[i] - t)
-                if (dist < bestDist) {
-                    bestDist = dist
-                    best = i
-                }
-            }
-            if (best >= 0) isDown[best] = true
-        }
-
-        return BeatAnalysis(beats, isDown, estimateBpm(beats), estimateBeatsPerBar(isDown))
+        val beatProb = FloatArray(frames) { sigmoid(beatLogits[it]) }
+        val downProb = FloatArray(frames) { sigmoid(downLogits[it]) }
+        return decode(beatProb, downProb, meters)
     }
 
-    /** Picos: logit positivo y máximo en una ventana de 7 frames; picos pegados se funden en su media. */
-    private fun pickPeaks(logits: FloatArray): DoubleArray {
+    /** Calcula golpes y compases a partir de las probabilidades. Se puede repetir sin volver a correr el modelo. */
+    fun decode(beatProb: FloatArray, downProb: FloatArray, meters: IntArray): BeatAnalysis {
+        val r = DbnTracker.decode(beatProb, downProb, meters)
+        if (r != null && r.frames.size >= 2) {
+            val beats = DoubleArray(r.frames.size) { r.frames[it] / FPS }
+            return BeatAnalysis(beats, r.numbers, estimateBpm(beats), r.meter, beatProb, downProb)
+        }
+
+        // Respaldo: picos simples (probabilidad > 0.5) si el seguimiento no encuentra pulso
+        val peaks = pickPeaks(beatProb, 0.5f)
+        val beats = DoubleArray(peaks.size) { peaks[it] / FPS }
+        val numbers = IntArray(beats.size) { it % 4 + 1 }
+        return BeatAnalysis(beats, numbers, estimateBpm(beats), 4, beatProb, downProb)
+    }
+
+    private fun sigmoid(x: Float): Float = (1.0 / (1.0 + exp(-x.toDouble()))).toFloat()
+
+    private fun pickPeaks(prob: FloatArray, threshold: Float): DoubleArray {
         val peaks = ArrayList<Int>()
-        for (i in logits.indices) {
-            val v = logits[i]
-            if (v <= 0f) continue
+        for (i in prob.indices) {
+            val v = prob[i]
+            if (v <= threshold) continue
             var isMax = true
             for (d in -3..3) {
                 val j = i + d
-                if (j in logits.indices && logits[j] > v) {
+                if (j in prob.indices && prob[j] > v) {
                     isMax = false
                     break
                 }
@@ -175,16 +180,9 @@ object BeatTracker {
 
     private fun estimateBpm(beats: DoubleArray): Double {
         if (beats.size < 3) return 0.0
-        val intervals = DoubleArray(beats.size - 1) { beats[it + 1] - beats[it] }.sortedArray()
+        val intervals = DoubleArray(beats.size - 1) { abs(beats[it + 1] - beats[it]) }.sortedArray()
         val median = intervals[intervals.size / 2]
         return if (median > 0) 60.0 / median else 0.0
-    }
-
-    private fun estimateBeatsPerBar(isDown: BooleanArray): Int {
-        val idx = isDown.indices.filter { isDown[it] }
-        if (idx.size < 2) return 4
-        val diffs = IntArray(idx.size - 1) { idx[it + 1] - idx[it] }.sortedArray()
-        return diffs[diffs.size / 2].coerceIn(2, 12)
     }
 
     private fun toMono22k(audio: DecodedAudio): FloatArray {
