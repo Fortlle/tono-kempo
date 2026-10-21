@@ -6,7 +6,7 @@ plugins {
 android {
     namespace = "com.tonokempo.app"
     compileSdk = 35
-    ndkVersion = "27.0.12077973"
+    ndkVersion = System.getenv("NDK_VERSION") ?: "27.0.12077973"
 
     defaultConfig {
         applicationId = "com.tonokempo.app"

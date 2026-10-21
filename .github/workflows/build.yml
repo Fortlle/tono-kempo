@@ -23,10 +23,13 @@ jobs:
           git -C app/src/main/cpp/rubberband log -1 --format="Rubber Band commit: %H"
           ls app/src/main/cpp/rubberband/single
 
-      - uses: android-actions/setup-android@v3
-
-      - name: Instalar NDK y CMake
-        run: sdkmanager "ndk;27.0.12077973" "cmake;3.22.1"
+      - name: Usar el NDK que ya trae el runner
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "NDK: $ANDROID_NDK_LATEST_HOME"
+          ls "$ANDROID_HOME/ndk" "$ANDROID_HOME/cmake" || true
+          echo "NDK_VERSION=$(basename "$ANDROID_NDK_LATEST_HOME")" >> "$GITHUB_ENV"
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
 
       - uses: gradle/actions/setup-gradle@v4
         with:
