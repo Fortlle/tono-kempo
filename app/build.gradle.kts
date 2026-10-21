@@ -12,8 +12,8 @@ android {
         applicationId = "com.tonokempo.app"
         minSdk = 24
         targetSdk = 34
-        versionCode = 4
-        versionName = "1.3"
+        versionCode = 5
+        versionName = "1.4"
 
         ndk {
             abiFilters += "arm64-v8a"
@@ -51,4 +51,6 @@ kotlin {
 dependencies {
     implementation("io.github.numq:kempo:1.0.0")
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
+    implementation("androidx.appcompat:appcompat:1.7.0")
+    implementation("com.google.android.material:material:1.12.0")
 }

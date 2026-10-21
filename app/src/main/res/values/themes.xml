@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.TonoKempo" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/tk_primary</item>
+        <item name="colorOnPrimary">@color/tk_on_primary</item>
+        <item name="colorPrimaryContainer">@color/tk_primary_container</item>
+        <item name="colorOnPrimaryContainer">@color/tk_on_primary_container</item>
+        <item name="colorSecondary">@color/tk_secondary</item>
+        <item name="colorOnSecondary">@color/tk_on_secondary</item>
+        <item name="colorSecondaryContainer">@color/tk_secondary_container</item>
+        <item name="colorOnSecondaryContainer">@color/tk_on_secondary_container</item>
+        <item name="colorSurface">@color/tk_surface</item>
+        <item name="colorOnSurface">@color/tk_on_surface</item>
+        <item name="colorSurfaceVariant">@color/tk_surface_variant</item>
+        <item name="colorOnSurfaceVariant">@color/tk_on_surface_variant</item>
+        <item name="colorOutline">@color/tk_outline</item>
+        <item name="colorOutlineVariant">@color/tk_outline_variant</item>
+        <item name="android:colorBackground">@color/tk_surface</item>
+        <item name="colorOnBackground">@color/tk_on_surface</item>
+    </style>
+</resources>

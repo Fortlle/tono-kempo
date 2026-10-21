@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="tk_primary">#4CDADA</color>
+    <color name="tk_on_primary">#003737</color>
+    <color name="tk_primary_container">#004F4F</color>
+    <color name="tk_on_primary_container">#6FF7F6</color>
+    <color name="tk_secondary">#B0CCCB</color>
+    <color name="tk_on_secondary">#1B3534</color>
+    <color name="tk_secondary_container">#324B4B</color>
+    <color name="tk_on_secondary_container">#CCE8E7</color>
+    <color name="tk_surface">#191C1C</color>
+    <color name="tk_on_surface">#E0E3E2</color>
+    <color name="tk_surface_variant">#3F4948</color>
+    <color name="tk_on_surface_variant">#BEC9C8</color>
+    <color name="tk_outline">#899392</color>
+    <color name="tk_outline_variant">#3F4948</color>
+</resources>
