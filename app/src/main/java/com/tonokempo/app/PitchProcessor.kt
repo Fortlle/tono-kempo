@@ -16,17 +16,22 @@ object PitchProcessor {
         semitones: Float,
         moveFormants: Boolean,
         engine: Engine,
+        timeRatio: Double = 1.0,
         report: (Float) -> Unit = {}
     ): ByteArray {
-        if (semitones == 0f) return audio.pcm
+        if (semitones == 0f && timeRatio == 1.0) return audio.pcm
 
-        return when (engine) {
+        // Kempo no se usa para cambiar la velocidad: Rubber Band lo hace con más calidad
+        val eff = if (timeRatio != 1.0) Engine.RUBBERBAND else engine
+
+        return when (eff) {
             Engine.RUBBERBAND -> RubberBandEngine.process(
                 audio.pcm,
                 audio.sampleRate,
                 audio.channels,
                 semitones,
                 !moveFormants,
+                timeRatio,
                 object : ProgressListener {
                     override fun onProgress(fraction: Float) = report(fraction)
                 }

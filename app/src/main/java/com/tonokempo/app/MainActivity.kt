@@ -8,7 +8,9 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.provider.OpenableColumns
+import android.text.Editable
 import android.text.InputType
+import android.text.TextWatcher
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -38,6 +40,15 @@ import com.google.android.material.R as MR
 /** Audio ya procesado, listo para reproducir o guardar. */
 class Rendered(val pcm: ByteArray, val sampleRate: Int, val channels: Int, val rangeKey: String = "")
 
+/** Ajustes de salida ya expresados en el tiempo del audio resultante (después de cambiar la velocidad). */
+class OutSettings(
+    val gains: FloatArray,
+    val startMs: Long,
+    val endMs: Long,
+    val click: ClickSpec?,
+    val rangeKey: String
+)
+
 class MainActivity : AppCompatActivity() {
 
     private companion object {
@@ -55,8 +66,8 @@ class MainActivity : AppCompatActivity() {
     // Estado de la canción
     private var audio: DecodedAudio? = null
     private var fileName = "audio"
-    private var cacheKey: String? = null
-    private var rendered: Rendered? = null
+    private var baseKey: String? = null
+    private var baseRendered: Rendered? = null
     @Volatile private var stems: SeparatedStems? = null
     @Volatile private var procFiles: List<File>? = null
     @Volatile private var procKey: String? = null
@@ -70,7 +81,8 @@ class MainActivity : AppCompatActivity() {
     // Estado de los controles
     private var stemsMode = true
     private var engineKempo = false
-    private var clickFixed = false
+    private var useDbn = false
+    private var clickFixed = true
     private var barChoice = 0      // 0 = automático, si no: tiempos por compás
     private var accentShift = 0    // cuántos golpes se mueve el acento
 
@@ -87,12 +99,18 @@ class MainActivity : AppCompatActivity() {
     private lateinit var volSliders: List<Slider>
     private lateinit var editStart: TextInputEditText
     private lateinit var editEnd: TextInputEditText
-    private lateinit var switchClick: MaterialSwitch
+    private lateinit var btnTempo: MaterialButton
     private lateinit var txtTempo: TextView
+    private lateinit var tempoPanel: LinearLayout
+    private lateinit var editBpmOrig: TextInputEditText
+    private lateinit var editBpmNew: TextInputEditText
+    private lateinit var switchStretch: MaterialSwitch
+    private lateinit var stretchPanel: LinearLayout
+    private lateinit var txtRatio: TextView
+    private lateinit var switchClick: MaterialSwitch
     private lateinit var clickPanel: LinearLayout
-    private lateinit var bpmRow: LinearLayout
-    private lateinit var editBpm: TextInputEditText
     private lateinit var sliderClick: Slider
+    private lateinit var sliderPhase: Slider
     private lateinit var txtShift: TextView
     private lateinit var btnPreview: MaterialButton
     private lateinit var btnPlay: MaterialButton
@@ -133,7 +151,7 @@ class MainActivity : AppCompatActivity() {
         setContentView(buildUi())
         updateToneLabel()
         updateModeUi()
-        updateClickPanel()
+        updateTempoPanel()
         refreshButtons()
         ui.post(ticker)
 
@@ -275,6 +293,36 @@ class MainActivity : AppCompatActivity() {
         return layout to edit
     }
 
+    /** Campo de BPM grande y editable con botones para ajustarlo. */
+    private fun bpmStepper(
+        hint: String,
+        ops: List<Pair<String, (Double) -> Double>>
+    ): Pair<LinearLayout, TextInputEditText> {
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val layout = TextInputLayout(this, null, MR.attr.textInputOutlinedStyle).apply { this.hint = hint }
+        val edit = TextInputEditText(layout.context).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+            textSize = 22f
+            gravity = Gravity.CENTER
+        }
+        layout.addView(edit)
+        box.addView(layout, lp(4))
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        ops.forEachIndexed { i, (label, fn) ->
+            val b = tonalButton(label) { parseBpm(edit)?.let { setBpmText(edit, fn(it)) } }
+            row.addView(b, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                if (i > 0) marginStart = dp(4)
+            })
+        }
+        box.addView(row, lp(6))
+        edit.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+            override fun afterTextChanged(s: Editable?) { updateRatioText() }
+        })
+        return box to edit
+    }
+
     private fun buildUi(): View {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -282,7 +330,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         root.addView(text("Tono Kempo", MR.style.TextAppearance_Material3_HeadlineMedium))
-        root.addView(muted("Cambia el tono de una canción sin cambiar su velocidad"))
+        root.addView(muted("Cambia el tono y la velocidad de una canción, con metrónomo opcional"))
 
         // ---- Canción ----
         root.addView(card("Canción") {
@@ -324,8 +372,9 @@ class MainActivity : AppCompatActivity() {
             }, lp(10))
 
             val noteStems = muted(
-                "Separa voz, batería, bajo y otros, transpone cada pista por separado y las vuelve a unir. " +
-                    "Tarda más, pero suena mucho mejor en canciones completas."
+                "Separa voz, batería, bajo y otros, cambia cada pista por separado y las vuelve a unir. " +
+                    "Tarda más, pero suena mucho mejor en canciones completas. " +
+                    "Si no cambias tono, velocidad ni volúmenes, no separa nada."
             )
             addView(noteStems, lp(8))
             stemsOnly.add(noteStems)
@@ -389,48 +438,95 @@ class MainActivity : AppCompatActivity() {
             row.addView(startLayout, LinearLayout.LayoutParams(half).apply { marginEnd = dp(8) })
             row.addView(endLayout, LinearLayout.LayoutParams(half).apply { marginStart = dp(8) })
             addView(row, lp(10))
-            addView(muted("Escribe los tiempos como minutos:segundos, por ejemplo 1:20 y 3:04. Vacío = toda la canción."), lp(6))
-        }.also { stemsOnly.add(it) }, lp(12))
-
-        // ---- Metrónomo ----
-        root.addView(card("Metrónomo") {
-            switchClick = MaterialSwitch(this@MainActivity).apply { text = "Agregar metrónomo" }
-            switchClick.setOnCheckedChangeListener { _, checked ->
-                if (checked && beatAnalysis == null) detectTempo()
-                updateClickPanel()
-            }
-            addView(switchClick, lp(8))
-            txtTempo = muted("Al activarlo se detecta el tempo de la canción.")
-            addView(txtTempo, lp(2))
-
-            clickPanel = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
-
-            clickPanel.addView(text("Cómo suena", MR.style.TextAppearance_Material3_LabelLarge), lp(14))
-            clickPanel.addView(toggle(listOf("Sigue la canción", "Tempo fijo"), 0) { idx ->
-                clickFixed = idx == 1
-                bpmRow.visibility = if (clickFixed) View.VISIBLE else View.GONE
-            }, lp(6))
-            clickPanel.addView(
-                muted("«Sigue la canción» marca cada golpe detectado y acompaña si la música acelera o frena. «Tempo fijo» marca un pulso perfectamente parejo, útil para canciones grabadas con metrónomo."),
+            addView(
+                muted("Minutos:segundos de la canción original, por ejemplo 1:20 y 3:04. Vacío = toda la canción."),
                 lp(6)
             )
+        }, lp(12))
 
-            bpmRow = LinearLayout(this@MainActivity).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                visibility = View.GONE
-            }
-            val bpmLayout = TextInputLayout(this@MainActivity, null, MR.attr.textInputOutlinedStyle).apply { hint = "BPM" }
-            editBpm = TextInputEditText(bpmLayout.context).apply {
-                inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
-            }
-            bpmLayout.addView(editBpm)
-            bpmRow.addView(tonalButton("½×") { scaleBpm(0.5) })
-            bpmRow.addView(iconOnly(R.drawable.ic_remove, "Bajar un BPM") { addBpm(-1.0) })
-            bpmRow.addView(bpmLayout, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            bpmRow.addView(iconOnly(R.drawable.ic_add, "Subir un BPM") { addBpm(1.0) })
-            bpmRow.addView(tonalButton("2×") { scaleBpm(2.0) })
-            clickPanel.addView(bpmRow, lp(8))
+        // ---- Tempo y metrónomo ----
+        root.addView(card("Tempo y metrónomo") {
+            addView(
+                muted("Detecta el tempo para cambiar la velocidad de la canción o agregar un metrónomo. No necesita separar pistas."),
+                lp(2)
+            )
+            btnTempo = filled("Detectar tempo") { detectTempo() }
+            addView(btnTempo, lp(10))
+            txtTempo = muted("Sin detectar.")
+            addView(txtTempo, lp(6))
+
+            tempoPanel = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
+
+            // Método de detección
+            tempoPanel.addView(text("Detección", MR.style.TextAppearance_Material3_LabelLarge), lp(14))
+            tempoPanel.addView(toggle(listOf("Picos", "Estable"), 0) { idx ->
+                useDbn = idx == 1
+                redecodeBeats()
+            }, lp(6))
+            tempoPanel.addView(
+                muted("«Picos» usa los golpes tal cual los marca el modelo. «Estable» fuerza un pulso regular y puede ayudar con canciones muy parejas. Prueba las dos."),
+                lp(4)
+            )
+
+            // Tempo original
+            tempoPanel.addView(
+                text("Tempo original (corrígelo si la detección se equivocó)", MR.style.TextAppearance_Material3_LabelLarge),
+                lp(16)
+            )
+            val (origBox, origEdit) = bpmStepper(
+                "BPM originales",
+                listOf<Pair<String, (Double) -> Double>>(
+                    "½×" to { it * 0.5 },
+                    "2×" to { it * 2.0 },
+                    "−0.1" to { it - 0.1 },
+                    "+0.1" to { it + 0.1 }
+                )
+            )
+            editBpmOrig = origEdit
+            tempoPanel.addView(origBox)
+
+            // Cambiar la velocidad
+            switchStretch = MaterialSwitch(this@MainActivity).apply { text = "Cambiar la velocidad de la canción" }
+            switchStretch.setOnCheckedChangeListener { _, _ -> updateTempoPanel() }
+            tempoPanel.addView(switchStretch, lp(16))
+
+            stretchPanel = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
+            stretchPanel.addView(
+                muted("Elige el tempo nuevo: la canción se hará más lenta o más rápida sin cambiar el tono, y el metrónomo seguirá el tempo nuevo."),
+                lp(2)
+            )
+            val (newBox, newEdit) = bpmStepper(
+                "BPM nuevos",
+                listOf<Pair<String, (Double) -> Double>>(
+                    "−1" to { it - 1.0 },
+                    "−0.1" to { it - 0.1 },
+                    "+0.1" to { it + 0.1 },
+                    "+1" to { it + 1.0 }
+                )
+            )
+            editBpmNew = newEdit
+            stretchPanel.addView(newBox)
+            stretchPanel.addView(tonalButton("Igual al original") {
+                parseBpm(editBpmOrig)?.let { setBpmText(editBpmNew, it) }
+            }, lp(2))
+            txtRatio = muted("")
+            stretchPanel.addView(txtRatio, lp(6))
+            tempoPanel.addView(stretchPanel)
+
+            // Metrónomo
+            switchClick = MaterialSwitch(this@MainActivity).apply { text = "Agregar metrónomo" }
+            switchClick.setOnCheckedChangeListener { _, _ -> updateTempoPanel() }
+            tempoPanel.addView(switchClick, lp(16))
+
+            clickPanel = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
+            clickPanel.addView(text("Cómo suena", MR.style.TextAppearance_Material3_LabelLarge), lp(6))
+            clickPanel.addView(toggle(listOf("Sigue la canción", "Tempo fijo"), 1) { idx ->
+                clickFixed = idx == 1
+            }, lp(6))
+            clickPanel.addView(
+                muted("«Tempo fijo» marca un pulso perfectamente parejo con los BPM de arriba: es lo más preciso para canciones grabadas con metrónomo. «Sigue la canción» marca cada golpe detectado y acompaña si la música acelera o frena."),
+                lp(6)
+            )
 
             clickPanel.addView(text("Compás", MR.style.TextAppearance_Material3_LabelLarge), lp(14))
             clickPanel.addView(toggle(listOf("Auto", "2", "3", "4", "6"), 0) { idx ->
@@ -438,7 +534,10 @@ class MainActivity : AppCompatActivity() {
                 redecodeBeats()
             }, lp(6))
 
-            clickPanel.addView(text("Si el acento (el clic más agudo) cae en el golpe equivocado, muévelo", MR.style.TextAppearance_Material3_LabelLarge), lp(14))
+            clickPanel.addView(
+                text("Si el acento (el clic más agudo) cae en el golpe equivocado, muévelo", MR.style.TextAppearance_Material3_LabelLarge),
+                lp(14)
+            )
             val shiftRow = LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER
@@ -454,11 +553,17 @@ class MainActivity : AppCompatActivity() {
             sliderClick = slider(0f, 100f, 5f, 60f) { "${it.toInt()}%" }
             clickPanel.addView(sliderClick)
 
-            btnPreview = tonalButton("Escuchar 15 segundos") { applyAndPlay(PREVIEW_MS) }
-            clickPanel.addView(btnPreview, lp(10))
+            clickPanel.addView(text("Adelantar o atrasar el metrónomo (milisegundos)", MR.style.TextAppearance_Material3_LabelLarge), lp(14))
+            sliderPhase = slider(-200f, 200f, 5f, 0f) { String.format(Locale.US, "%+d ms", it.toInt()) }
+            clickPanel.addView(sliderPhase)
+            clickPanel.addView(muted("Negativo = los clics suenan antes; positivo = después."), lp(2))
+            tempoPanel.addView(clickPanel)
 
-            addView(clickPanel)
-        }.also { stemsOnly.add(it) }, lp(12))
+            btnPreview = tonalButton("Escuchar 15 segundos") { applyAndPlay(PREVIEW_MS) }
+            tempoPanel.addView(btnPreview, lp(14))
+
+            addView(tempoPanel)
+        }, lp(12))
 
         // ---- Reproducir y guardar ----
         root.addView(card("Escuchar y guardar") {
@@ -540,10 +645,31 @@ class MainActivity : AppCompatActivity() {
         modelBanner.visibility = if (needModel) View.VISIBLE else View.GONE
     }
 
-    private fun updateClickPanel() {
+    private fun updateTempoPanel() {
         val ready = beatAnalysis?.beats?.isNotEmpty() == true
-        clickPanel.visibility = if (switchClick.isChecked && ready) View.VISIBLE else View.GONE
-        btnPreview.visibility = if (switchClick.isChecked && ready) View.VISIBLE else View.GONE
+        tempoPanel.visibility = if (ready) View.VISIBLE else View.GONE
+        stretchPanel.visibility = if (switchStretch.isChecked) View.VISIBLE else View.GONE
+        clickPanel.visibility = if (switchClick.isChecked) View.VISIBLE else View.GONE
+        updateRatioText()
+    }
+
+    private fun updateRatioText() {
+        if (!::txtRatio.isInitialized) return
+        val o = parseBpm(editBpmOrig)
+        val n = parseBpm(editBpmNew)
+        if (o == null || n == null) {
+            txtRatio.text = "Escribe los BPM."
+            return
+        }
+        val raw = o / n
+        val ratio = raw.coerceIn(0.5, 2.0)
+        val pct = Math.round(ratio * 100.0)
+        val limit = if (raw != ratio) " (límite: entre 50 % y 200 % de la duración)" else ""
+        txtRatio.text = when {
+            ratio > 1.0005 -> "La canción pasa de %.2f a %.2f BPM: dura %d %% de lo original (más lenta).".format(Locale.US, o, n, pct) + limit
+            ratio < 0.9995 -> "La canción pasa de %.2f a %.2f BPM: dura %d %% de lo original (más rápida).".format(Locale.US, o, n, pct) + limit
+            else -> "Mismo tempo: la canción no cambia de velocidad."
+        }
     }
 
     private fun refreshButtons() {
@@ -552,9 +678,9 @@ class MainActivity : AppCompatActivity() {
         btnPlay.isEnabled = loaded && !busy
         btnPreview.isEnabled = loaded && !busy
         btnSave.isEnabled = loaded && !busy
+        btnTempo.isEnabled = loaded && !busy
         btnModel.isEnabled = !busy
         btnImport.isEnabled = !busy
-        switchClick.isEnabled = loaded && !busy
         btnPause.isEnabled = player.isActive
         btnStop.isEnabled = player.isActive
         sliderPos.isEnabled = player.isActive
@@ -620,19 +746,12 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun currentBpm(): Double? =
-        editBpm.text.toString().trim().replace(',', '.').toDoubleOrNull()
+    private fun parseBpm(edit: TextInputEditText): Double? =
+        edit.text?.toString()?.trim()?.replace(',', '.')?.toDoubleOrNull()?.takeIf { it > 0.0 }
 
-    private fun setBpm(v: Double) {
-        editBpm.setText(String.format(Locale.US, "%.1f", v.coerceIn(30.0, 300.0)))
-    }
-
-    private fun scaleBpm(f: Double) {
-        currentBpm()?.let { setBpm(it * f) }
-    }
-
-    private fun addBpm(d: Double) {
-        currentBpm()?.let { setBpm(it + d) }
+    private fun setBpmText(edit: TextInputEditText, v: Double) {
+        edit.setText(String.format(Locale.US, "%.2f", v.coerceIn(30.0, 300.0)))
+        edit.setSelection(edit.text?.length ?: 0)
     }
 
     private fun shiftAccent(d: Int) {
@@ -697,17 +816,18 @@ class MainActivity : AppCompatActivity() {
     private fun loadUri(uri: Uri) {
         player.stop()
         audio = null
-        cacheKey = null
-        rendered = null
+        baseKey = null
+        baseRendered = null
         stems = null
         procFiles = null
         procKey = null
         beatAnalysis = null
         accentShift = 0
         txtShift.text = "0"
-        txtTempo.text = "Al activarlo se detecta el tempo de la canción."
+        txtTempo.text = "Sin detectar."
+        switchStretch.isChecked = false
         switchClick.isChecked = false
-        updateClickPanel()
+        updateTempoPanel()
         stemsDir().deleteRecursively()
         val name = displayName(uri)
         setBusy(true, "Decodificando…")
@@ -797,13 +917,24 @@ class MainActivity : AppCompatActivity() {
     // Tempo y metrónomo
     // =====================================================================
 
-    private fun detectTempo() {
-        val a = audio
-        if (a == null) {
-            switchClick.isChecked = false
-            setStatus("Primero elige un audio.")
+    private fun meters(): IntArray = if (barChoice == 0) intArrayOf(3, 4) else intArrayOf(barChoice)
+
+    private fun showAnalysis(an: BeatAnalysis) {
+        if (an.beats.isEmpty() || an.bpm <= 0.0) {
+            txtTempo.text = "No se detectaron golpes claros en esta canción."
             return
         }
+        txtTempo.text = String.format(
+            Locale.getDefault(),
+            "Detectado: %.2f BPM, compás de %d tiempos, %d golpes.",
+            an.bpm, an.meter, an.beats.size
+        )
+        setBpmText(editBpmOrig, an.bpm)
+        setBpmText(editBpmNew, an.bpm)
+    }
+
+    private fun detectTempo() {
+        val a = audio ?: return
         if (busy) return
         cancelFlag.set(false)
         setBusy(true, "Preparando…", canCancel = true)
@@ -816,61 +947,40 @@ class MainActivity : AppCompatActivity() {
                         ui.post { setStatus("Descargando modelo de tempo… ${(p * 100).toInt()}%", p) }
                     }
                 }
-                val an = BeatTracker.analyze(ctx, a, meters(), cancelFlag) { p ->
+                val an = BeatTracker.analyze(ctx, a, meters(), useDbn, cancelFlag) { p ->
                     ui.post { setStatus("Detectando tempo… ${(p * 100).toInt()}%", p) }
                 }
                 ui.post {
                     beatAnalysis = an
-                    if (an.beats.isEmpty() || an.bpm <= 0.0) {
-                        txtTempo.text = "No se detectaron golpes claros en esta canción."
-                        switchClick.isChecked = false
-                        setBusy(false, "Sin resultado de tempo")
-                    } else {
-                        txtTempo.text = tempoText(an)
-                        setBpm(an.bpm)
-                        setBusy(false, "Tempo detectado")
-                    }
-                    updateClickPanel()
+                    accentShift = 0
+                    txtShift.text = "0"
+                    updateTempoPanel()
+                    showAnalysis(an)
+                    setBusy(false, if (an.beats.isEmpty()) "Sin resultado de tempo" else "Tempo detectado")
                 }
             } catch (e: CancelledException) {
-                ui.post {
-                    switchClick.isChecked = false
-                    setBusy(false, "Cancelado")
-                    updateClickPanel()
-                }
+                ui.post { setBusy(false, "Cancelado") }
             } catch (e: Throwable) {
-                ui.post {
-                    switchClick.isChecked = false
-                    setBusy(false, "Error al detectar tempo: ${e.message ?: e.javaClass.simpleName}")
-                    updateClickPanel()
-                }
+                ui.post { setBusy(false, "Error al detectar tempo: ${e.message ?: e.javaClass.simpleName}") }
             }
         }.start()
     }
 
-    private fun meters(): IntArray = if (barChoice == 0) intArrayOf(3, 4) else intArrayOf(barChoice)
-
-    private fun tempoText(an: BeatAnalysis): String = String.format(
-        Locale.getDefault(),
-        "Tempo detectado: %.1f BPM, compás de %d tiempos",
-        an.bpm, an.meter
-    )
-
-    /** Vuelve a calcular compases con los tiempos por compás elegidos (sin repetir el modelo). */
+    /** Vuelve a calcular golpes y compases con el método y los tiempos por compás elegidos (sin repetir el modelo). */
     private fun redecodeBeats() {
         val an = beatAnalysis ?: return
         if (busy) return
-        setBusy(true, "Recalculando compás…")
+        setBusy(true, "Recalculando…")
         Thread {
             try {
-                val re = BeatTracker.decode(an.beatProb, an.downProb, meters())
+                val re = BeatTracker.decode(an.beatProb, an.downProb, meters(), useDbn)
                 ui.post {
                     beatAnalysis = re
                     accentShift = 0
                     txtShift.text = "0"
-                    txtTempo.text = tempoText(re)
-                    setBusy(false, "Compás actualizado")
-                    updateClickPanel()
+                    showAnalysis(re)
+                    updateTempoPanel()
+                    setBusy(false, "Listo")
                 }
             } catch (e: Throwable) {
                 ui.post { setBusy(false, "Error al recalcular: ${e.message ?: e.javaClass.simpleName}") }
@@ -878,66 +988,83 @@ class MainActivity : AppCompatActivity() {
         }.start()
     }
 
-    private fun buildClick(a: DecodedAudio): ClickSpec? {
+    /** Razón de tiempo de la salida respecto al original (1 = igual, 1.2 = 20 % más larga y lenta). */
+    private fun timeRatio(): Double {
+        if (!switchStretch.isChecked || beatAnalysis == null) return 1.0
+        val o = parseBpm(editBpmOrig) ?: return 1.0
+        val n = parseBpm(editBpmNew) ?: return 1.0
+        return (o / n).coerceIn(0.5, 2.0)
+    }
+
+    /** Metrónomo en el tiempo del audio resultante. */
+    private fun buildClick(a: DecodedAudio, ratio: Double): ClickSpec? {
         if (!switchClick.isChecked) return null
         val an = beatAnalysis ?: return null
         val n = an.beats.size
         if (n == 0) return null
         val gain = sliderClick.value / 100f
         val meter = an.meter
+        val phase = sliderPhase.value / 1000.0
 
-        val bpm = currentBpm()
-        if (clickFixed && bpm != null && bpm in 30.0..300.0) {
-            // Pulso parejo, con la fase del primer "primer tiempo" detectado
-            val step = 60.0 / bpm
-            val firstDown = an.beatInBar.indexOfFirst { it == 1 }.let { if (it < 0) 0 else it }
-            val t0 = an.beats[firstDown]
-            val duration = a.durationMs / 1000.0
-            val times = ArrayList<Double>()
-            val accent = ArrayList<Boolean>()
-            var k = -floor(t0 / step).toInt()
-            while (true) {
-                val t = t0 + k * step
-                if (t >= duration) break
-                if (t >= 0.0) {
-                    times.add(t)
-                    accent.add(Math.floorMod(k - accentShift, meter) == 0)
+        if (clickFixed) {
+            // Pulso perfectamente parejo. BPM de la canción original, o el nuevo si se cambió la velocidad.
+            val origBpm = parseBpm(editBpmOrig) ?: an.bpm
+            val outBpm = if (switchStretch.isChecked) (parseBpm(editBpmNew) ?: origBpm) else origBpm
+            if (outBpm > 0.0) {
+                val step = 60.0 / outBpm
+                val t0 = an.gridT0 * ratio + phase
+                val duration = a.durationMs / 1000.0 * ratio
+                val times = ArrayList<Double>()
+                val accent = ArrayList<Boolean>()
+                var k = -floor(t0 / step).toInt()
+                while (true) {
+                    val t = t0 + k * step
+                    if (t >= duration) break
+                    if (t >= 0.0) {
+                        times.add(t)
+                        accent.add(Math.floorMod(k - accentShift, meter) == 0)
+                    }
+                    k++
                 }
-                k++
+                return ClickSpec(times.toDoubleArray(), accent.toBooleanArray(), gain)
             }
-            return ClickSpec(times.toDoubleArray(), accent.toBooleanArray(), gain)
         }
 
         // Sigue los golpes detectados; el acento va en el golpe 1 de cada compás (movible con ◀ ▶)
+        val times = DoubleArray(n) { an.beats[it] * ratio + phase }
         val accent = BooleanArray(n) { i -> Math.floorMod(an.beatInBar[i] - 1 - accentShift, meter) == 0 }
-        return ClickSpec(an.beats, accent, gain)
+        return ClickSpec(times, accent, gain)
     }
 
-    private fun buildMixSettings(a: DecodedAudio, previewMs: Long?): MixSettings? {
+    /** Lee fragmento, volúmenes y metrónomo; los tiempos se convierten al audio resultante. */
+    private fun buildOutSettings(a: DecodedAudio, ratio: Double, previewMs: Long?): OutSettings? {
         val s = parseTimeMs(editStart.text.toString())
         val e = parseTimeMs(editEnd.text.toString())
         if (s == TIME_INVALID || e == TIME_INVALID) {
             setStatus("Tiempo no válido. Usa minutos:segundos, por ejemplo 1:20.")
             return null
         }
-        val startMs = if (s == TIME_EMPTY) 0L else s
-        var endMs = if (e == TIME_EMPTY) -1L else e
-        if (endMs in 0..startMs) {
+        val startOrig = if (s == TIME_EMPTY) 0L else s
+        val endOrig = if (e == TIME_EMPTY) -1L else e
+        if (endOrig in 0..startOrig) {
             setStatus("El fin debe ser mayor que el inicio.")
             return null
         }
-        if (startMs >= a.durationMs) {
+        if (startOrig >= a.durationMs) {
             setStatus("El inicio está después del final de la canción.")
             return null
         }
+        val startOut = (startOrig * ratio).toLong()
+        var endOut = if (endOrig < 0) -1L else (endOrig * ratio).toLong()
         if (previewMs != null) {
-            val cap = startMs + previewMs
-            endMs = if (endMs < 0) cap else min(endMs, cap)
+            val cap = startOut + previewMs
+            endOut = if (endOut < 0) cap else min(endOut, cap)
         }
         // Orden interno: batería, bajo, otros, voz. En pantalla: voz, batería, bajo, otros.
         val v = volSliders.map { it.value / 100f }
         val gains = floatArrayOf(v[1], v[2], v[3], v[0])
-        return MixSettings(gains, startMs, endMs, buildClick(a))
+        val rangeKey = "${editStart.text.toString().trim()}|${editEnd.text.toString().trim()}|${previewMs ?: 0}"
+        return OutSettings(gains, startOut, endOut, buildClick(a, ratio), rangeKey)
     }
 
     // =====================================================================
@@ -946,34 +1073,59 @@ class MainActivity : AppCompatActivity() {
 
     private fun process(previewMs: Long?, then: (Rendered) -> Unit) {
         val a = audio ?: return
-        if (stemsMode) processStems(a, previewMs, then) else processWhole(a, then)
+        val st = semitones()
+        val ratio = timeRatio()
+        val out = buildOutSettings(a, ratio, previewMs) ?: return
+
+        val gainsDefault = out.gains.all { it == 1f }
+        val nothingToChange = st == 0f && ratio == 1.0 && gainsDefault
+
+        if (stemsMode && !nothingToChange) processStems(a, st, ratio, out, then)
+        else processWhole(a, st, ratio, out, nothingToChange, then)
     }
 
-    private fun processWhole(a: DecodedAudio, then: (Rendered) -> Unit) {
-        val st = semitones()
+    /** Procesa la canción entera (o la deja igual) y después recorta y agrega el metrónomo. */
+    private fun processWhole(
+        a: DecodedAudio,
+        st: Float,
+        ratio: Double,
+        out: OutSettings,
+        untouched: Boolean,
+        then: (Rendered) -> Unit
+    ) {
         val moveFormants = !switchPreserve.isChecked
-        val eng = if (engineKempo) Engine.KEMPO else Engine.RUBBERBAND
-        val key = "whole|$st|$moveFormants|$eng"
+        val eng = if (ratio != 1.0 || !engineKempo) Engine.RUBBERBAND else Engine.KEMPO
+        val key = if (untouched) "orig" else "whole|$st|$moveFormants|$eng|$ratio"
 
-        val cached = rendered
-        if (key == cacheKey && cached != null) {
-            then(cached)
+        fun finish(base: Rendered) {
+            val pcm = Finisher.cropAndClick(base.pcm, base.sampleRate, base.channels, out.startMs, out.endMs, out.click)
+            then(Rendered(pcm, base.sampleRate, base.channels, out.rangeKey))
+        }
+
+        val cached = baseRendered
+        if (key == baseKey && cached != null) {
+            try {
+                finish(cached)
+            } catch (e: Throwable) {
+                setStatus("Error: ${e.message ?: e.javaClass.simpleName}")
+            }
             return
         }
 
         val engineName = if (eng == Engine.RUBBERBAND) "Rubber Band" else "Kempo"
-        setBusy(true, "Procesando con $engineName…")
+        setBusy(true, if (untouched) "Preparando…" else "Procesando con $engineName…")
         Thread {
             try {
-                val out = PitchProcessor.shift(a, st, moveFormants, eng) { p ->
+                val pcm = if (untouched) a.pcm else PitchProcessor.shift(a, st, moveFormants, eng, ratio) { p ->
                     ui.post { setStatus("Procesando con $engineName… ${(p * 100).toInt()}%", p) }
                 }
-                val r = Rendered(out, a.sampleRate, a.channels)
+                val base = Rendered(pcm, a.sampleRate, a.channels)
+                val result = Finisher.cropAndClick(base.pcm, base.sampleRate, base.channels, out.startMs, out.endMs, out.click)
                 ui.post {
-                    cacheKey = key
-                    rendered = r
+                    baseKey = key
+                    baseRendered = base
                     setBusy(false, "Listo")
-                    then(r)
+                    then(Rendered(result, base.sampleRate, base.channels, out.rangeKey))
                 }
             } catch (e: Throwable) {
                 ui.post { setBusy(false, "Error al procesar: ${e.message ?: e.javaClass.simpleName}") }
@@ -981,19 +1133,22 @@ class MainActivity : AppCompatActivity() {
         }.start()
     }
 
-    private fun processStems(a: DecodedAudio, previewMs: Long?, then: (Rendered) -> Unit) {
+    private fun processStems(
+        a: DecodedAudio,
+        st: Float,
+        ratio: Double,
+        out: OutSettings,
+        then: (Rendered) -> Unit
+    ) {
         if (!StemSeparator.hasModel(this)) {
             setStatus("Falta el modelo de separación. Usa el botón Descargar modelo.")
             updateModeUi()
             return
         }
-        val settings = buildMixSettings(a, previewMs) ?: return
-        val rangeKey = "${editStart.text.toString().trim()}|${editEnd.text.toString().trim()}|${previewMs ?: 0}"
-
-        val st = semitones()
         val moveFormants = !switchPreserve.isChecked
         val drums = switchDrums.isChecked
-        val key = "$st|$moveFormants|$drums"
+        val key = "$st|$moveFormants|$drums|$ratio"
+        val settings = MixSettings(out.gains, out.startMs, out.endMs, out.click)
 
         cancelFlag.set(false)
         setBusy(true, "Preparando…", canCancel = true)
@@ -1010,13 +1165,13 @@ class MainActivity : AppCompatActivity() {
                     }.also { s -> stems = s }
                 }
 
-                // 2) Transponer cada pista (solo si cambió el tono, el timbre o la batería)
+                // 2) Transponer / cambiar la velocidad de cada pista (solo si cambió algo)
                 val cachedFiles = procFiles
                 val ready: List<File> = if (procKey == key && cachedFiles != null) {
                     cachedFiles
                 } else {
                     ui.post { setStatus("Procesando pistas con Rubber Band…", 0f) }
-                    StemMixer.prepare(sep, stemsDir(), st, moveFormants, drums, cancelFlag) { p ->
+                    StemMixer.prepare(sep, stemsDir(), st, ratio, moveFormants, drums, cancelFlag) { p ->
                         ui.post { setStatus("Procesando pistas… ${(p * 100).toInt()}%", p) }
                     }.also { files ->
                         procFiles = files
@@ -1027,9 +1182,8 @@ class MainActivity : AppCompatActivity() {
                 // 3) Mezclar con volúmenes, fragmento y metrónomo (rápido)
                 ui.post { setStatus("Mezclando…") }
                 val pcm = StemMixer.mix(ready, settings)
-                val r = Rendered(pcm, StemSeparator.SAMPLE_RATE, 2, rangeKey)
+                val r = Rendered(pcm, StemSeparator.SAMPLE_RATE, 2, out.rangeKey)
                 ui.post {
-                    rendered = r
                     setBusy(false, "Listo")
                     then(r)
                 }

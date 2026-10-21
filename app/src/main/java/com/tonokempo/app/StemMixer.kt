@@ -39,13 +39,15 @@ object StemMixer {
     private const val SR = StemSeparator.SAMPLE_RATE
 
     /**
-     * Transpone cada pista por separado con Rubber Band (en paralelo) y deja los resultados en [workDir].
-     * Devuelve los 4 archivos que se deben mezclar (la batería original si no se transpone).
+     * Transpone y/o cambia la velocidad de cada pista por separado con Rubber Band (en paralelo)
+     * y deja los resultados en [workDir]. Devuelve los 4 archivos que se deben mezclar.
+     * La batería original se conserva tal cual si no se transpone y la velocidad no cambia.
      */
     fun prepare(
         stems: SeparatedStems,
         workDir: File,
         semitones: Float,
+        timeRatio: Double,
         moveFormants: Boolean,
         transposeDrums: Boolean,
         cancel: AtomicBoolean,
@@ -53,10 +55,13 @@ object StemMixer {
     ): List<File> {
         workDir.listFiles { f -> f.name.startsWith("proc_") }?.forEach { it.delete() }
         val sources = stems.files
-        if (semitones == 0f) return sources
+
+        // Semitonos de cada pista: la batería solo se transpone si se pidió
+        val sem = FloatArray(4) { i -> if (i == 0 && !transposeDrums) 0f else semitones }
+        val toProcess = (0 until 4).filter { sem[it] != 0f || timeRatio != 1.0 }
+        if (toProcess.isEmpty()) return sources
 
         val outFiles = List(4) { File(workDir, "proc_${StemSeparator.STEM_NAMES[it]}.pcm") }
-        val toProcess = (0 until 4).filter { it != 0 || transposeDrums }
         val progress = AtomicIntegerArray(4)
         val pool = Executors.newFixedThreadPool(PARALLEL)
         try {
@@ -68,8 +73,9 @@ object StemMixer {
                         pcm,
                         SR,
                         2,
-                        semitones,
+                        sem[i],
                         !moveFormants,
+                        timeRatio,
                         object : ProgressListener {
                             override fun onProgress(fraction: Float) {
                                 progress.set(i, (fraction * 100).toInt())
@@ -92,7 +98,7 @@ object StemMixer {
         } finally {
             pool.shutdownNow()
         }
-        return List(4) { i -> if (i == 0 && !transposeDrums) sources[0] else outFiles[i] }
+        return List(4) { i -> if (i in toProcess) outFiles[i] else sources[i] }
     }
 
     /** Suma las 4 pistas con su volumen, recorta al fragmento y agrega el metrónomo si se pidió. */
@@ -125,41 +131,8 @@ object StemMixer {
             }
         }
 
-        s.click?.let { if (it.gain > 0f) addClicks(out, startFrame, frames, it) }
+        s.click?.let { if (it.gain > 0f) Finisher.addClicks(out, SR, 2, startFrame, frames, it) }
         return out
-    }
-
-    private fun addClicks(out: ByteArray, startFrame: Long, frames: Int, c: ClickSpec) {
-        val len = (0.04 * SR).toInt()
-        val normal = FloatArray(len) { n ->
-            val t = n / SR.toFloat()
-            (sin(2.0 * PI * 1000.0 * t) * exp(-t / 0.008)).toFloat()
-        }
-        val accent = FloatArray(len) { n ->
-            val t = n / SR.toFloat()
-            (sin(2.0 * PI * 1500.0 * t) * exp(-t / 0.008)).toFloat()
-        }
-
-        for (i in c.times.indices) {
-            val pos = (c.times[i] * SR).roundToLong() - startFrame
-            if (pos >= frames || pos + len <= 0) continue
-            val isAccent = c.accent[i]
-            val table = if (isAccent) accent else normal
-            val amp = (if (isAccent) 0.9f else 0.6f) * c.gain * 32767f
-            for (n in 0 until len) {
-                val idx = pos + n
-                if (idx < 0 || idx >= frames) continue
-                val add = (table[n] * amp).toInt()
-                val base = idx.toInt() * 4
-                for (ch in 0..1) {
-                    val o = base + ch * 2
-                    val cur = (out[o].toInt() and 0xFF) or (out[o + 1].toInt() shl 8)
-                    val v = (cur + add).coerceIn(-32768, 32767)
-                    out[o] = v.toByte()
-                    out[o + 1] = (v shr 8).toByte()
-                }
-            }
-        }
     }
 
     private fun forEachChunk(

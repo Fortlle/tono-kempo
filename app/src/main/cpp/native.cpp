@@ -27,7 +27,7 @@ extern "C" JNIEXPORT jbyteArray JNICALL
 Java_com_tonokempo_app_RubberBandEngine_process(JNIEnv *env, jobject /*thiz*/,
                                                 jbyteArray pcmIn, jint sampleRate, jint channelsIn,
                                                 jfloat semitones, jboolean preserveFormants,
-                                                jobject listener) {
+                                                jdouble timeRatioIn, jobject listener) {
     try {
         const size_t ch = static_cast<size_t>(channelsIn);
         const size_t totalFrames = static_cast<size_t>(env->GetArrayLength(pcmIn)) / (2 * ch);
@@ -56,8 +56,10 @@ Java_com_tonokempo_app_RubberBandEngine_process(JNIEnv *env, jobject /*thiz*/,
                                         : RubberBandStretcher::OptionFormantShifted);
 
         const double pitchScale = std::pow(2.0, static_cast<double>(semitones) / 12.0);
+        // Razón de tiempo: 1.0 = misma duración; 1.2 = 20 % más larga (más lenta); 0.8 = más corta (más rápida)
+        const double timeRatio = (timeRatioIn > 0.05 && timeRatioIn < 20.0) ? timeRatioIn : 1.0;
 
-        RubberBandStretcher rb(static_cast<size_t>(sampleRate), ch, options, 1.0, pitchScale);
+        RubberBandStretcher rb(static_cast<size_t>(sampleRate), ch, options, timeRatio, pitchScale);
         rb.setExpectedInputDuration(totalFrames);
         rb.setMaxProcessSize(BLOCK);
 
@@ -83,7 +85,8 @@ Java_com_tonokempo_app_RubberBandEngine_process(JNIEnv *env, jobject /*thiz*/,
         }
 
         std::vector<int16_t> out;
-        out.reserve(totalFrames * ch + static_cast<size_t>(sampleRate) * ch);
+        out.reserve(static_cast<size_t>(static_cast<double>(totalFrames) * timeRatio) * ch +
+                    static_cast<size_t>(sampleRate) * ch);
 
         std::vector<std::vector<float>> outBuf(ch, std::vector<float>(RETRIEVE_BLOCK));
         std::vector<float *> outPtrs(ch);

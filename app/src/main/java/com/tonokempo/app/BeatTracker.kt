@@ -9,20 +9,28 @@ import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.PI
 import kotlin.math.abs
+import kotlin.math.atan2
 import kotlin.math.ceil
+import kotlin.math.cos
 import kotlin.math.exp
 import kotlin.math.min
+import kotlin.math.sin
 
 /**
- * Resultado de la detección: tiempos de cada golpe (segundos), número de cada golpe dentro del compás
- * (1 = primer tiempo), tempo, tiempos por compás y las probabilidades del modelo (para recalcular).
+ * Resultado de la detección.
+ * [beats]: tiempo de cada golpe en segundos. [beatInBar]: número de cada golpe dentro del compás (1 = primer tiempo).
+ * [bpm]: tempo ajustado por mínimos cuadrados sobre todos los golpes (más preciso que el de un solo intervalo).
+ * [gridT0]: tiempo de un primer tiempo sobre la rejilla ajustada, para generar un pulso fijo alineado.
+ * [beatProb]/[downProb]: probabilidades del modelo, para recalcular sin volver a correrlo.
  */
 class BeatAnalysis(
     val beats: DoubleArray,
     val beatInBar: IntArray,
     val bpm: Double,
     val meter: Int,
+    val gridT0: Double,
     val beatProb: FloatArray,
     val downProb: FloatArray
 )
@@ -63,6 +71,7 @@ object BeatTracker {
         context: Context,
         audio: DecodedAudio,
         meters: IntArray,
+        useDbn: Boolean,
         cancel: AtomicBoolean,
         onProgress: (Float) -> Unit
     ): BeatAnalysis {
@@ -126,22 +135,140 @@ object BeatTracker {
 
         val beatProb = FloatArray(frames) { sigmoid(beatLogits[it]) }
         val downProb = FloatArray(frames) { sigmoid(downLogits[it]) }
-        return decode(beatProb, downProb, meters)
+        return decode(beatProb, downProb, meters, useDbn)
     }
 
-    /** Calcula golpes y compases a partir de las probabilidades. Se puede repetir sin volver a correr el modelo. */
-    fun decode(beatProb: FloatArray, downProb: FloatArray, meters: IntArray): BeatAnalysis {
-        val r = DbnTracker.decode(beatProb, downProb, meters)
-        if (r != null && r.frames.size >= 2) {
-            val beats = DoubleArray(r.frames.size) { r.frames[it] / FPS }
-            return BeatAnalysis(beats, r.numbers, estimateBpm(beats), r.meter, beatProb, downProb)
+    /**
+     * Calcula golpes y compases a partir de las probabilidades. Se puede repetir sin volver a correr el modelo.
+     * [useDbn] = false: picos simples del modelo (fiel a lo que oye). true: seguimiento con tempo restringido.
+     */
+    fun decode(beatProb: FloatArray, downProb: FloatArray, meters: IntArray, useDbn: Boolean): BeatAnalysis {
+        if (useDbn) {
+            val r = DbnTracker.decode(beatProb, downProb, meters)
+            if (r != null && r.frames.size >= 2) {
+                val beats = DoubleArray(r.frames.size) { r.frames[it] / FPS }
+                return assemble(beats, r.numbers, r.meter, beatProb, downProb)
+            }
         }
 
-        // Respaldo: picos simples (probabilidad > 0.5) si el seguimiento no encuentra pulso
-        val peaks = pickPeaks(beatProb, 0.5f)
-        val beats = DoubleArray(peaks.size) { peaks[it] / FPS }
-        val numbers = IntArray(beats.size) { it % 4 + 1 }
-        return BeatAnalysis(beats, numbers, estimateBpm(beats), 4, beatProb, downProb)
+        val bPeaks = pickPeaks(beatProb, 0.5f)
+        val dPeaks = pickPeaks(downProb, 0.5f)
+        val beats = DoubleArray(bPeaks.size) { bPeaks[it] / FPS }
+        val isDown = BooleanArray(beats.size)
+        for (d in dPeaks) {
+            val t = d / FPS
+            var best = -1
+            var bestDist = Double.MAX_VALUE
+            for (i in beats.indices) {
+                val dist = abs(beats[i] - t)
+                if (dist < bestDist) {
+                    bestDist = dist
+                    best = i
+                }
+            }
+            if (best >= 0) isDown[best] = true
+        }
+
+        val meter = if (meters.size == 1) meters[0] else {
+            val est = estimateBeatsPerBar(isDown)
+            meters.minByOrNull { abs(it - est) } ?: 4
+        }
+        return assemble(beats, numberBeats(beats.size, isDown, meter), meter, beatProb, downProb)
+    }
+
+    private fun assemble(
+        beats: DoubleArray,
+        numbers: IntArray,
+        meter: Int,
+        beatProb: FloatArray,
+        downProb: FloatArray
+    ): BeatAnalysis {
+        val grid = fitGrid(beats)
+        val period = grid?.first ?: (if (beats.size >= 3) medianInterval(beats) else 0.0)
+        val bpm = if (period > 0) 60.0 / period else 0.0
+
+        // Referencia de la rejilla: un primer tiempo (si hay) sobre la línea ajustada
+        var t0 = beats.firstOrNull() ?: 0.0
+        if (grid != null && beats.isNotEmpty()) {
+            val firstDown = numbers.indexOfFirst { it == 1 }.let { if (it < 0) 0 else it }
+            val n = Math.round((beats[firstDown] - grid.second) / grid.first).toDouble()
+            t0 = grid.second + n * grid.first
+        }
+        return BeatAnalysis(beats, numbers, bpm, meter, t0, beatProb, downProb)
+    }
+
+    private fun medianInterval(beats: DoubleArray): Double {
+        val iv = DoubleArray(beats.size - 1) { abs(beats[it + 1] - beats[it]) }.sortedArray()
+        return iv[iv.size / 2]
+    }
+
+    /**
+     * Ajusta una rejilla regular (periodo, tiempo del golpe 0) a los golpes detectados:
+     * fase inicial por media circular y regresión lineal sobre los golpes que encajan, descartando los demás.
+     */
+    private fun fitGrid(beats: DoubleArray): Pair<Double, Double>? {
+        if (beats.size < 8) return null
+        var period = medianInterval(beats)
+        if (period <= 0.0) return null
+
+        var sx = 0.0
+        var sy = 0.0
+        for (b in beats) {
+            val ang = 2.0 * PI * b / period
+            sx += cos(ang)
+            sy += sin(ang)
+        }
+        var t0 = atan2(sy, sx) / (2.0 * PI) * period
+
+        repeat(6) {
+            var n = 0
+            var sumX = 0.0
+            var sumY = 0.0
+            var sumXX = 0.0
+            var sumXY = 0.0
+            for (b in beats) {
+                val idx = Math.round((b - t0) / period).toDouble()
+                val res = b - (t0 + idx * period)
+                if (abs(res) < 0.2 * period) {
+                    n++
+                    sumX += idx
+                    sumY += b
+                    sumXX += idx * idx
+                    sumXY += idx * b
+                }
+            }
+            if (n < 8) return@repeat
+            val denom = n * sumXX - sumX * sumX
+            if (abs(denom) < 1e-9) return@repeat
+            val slope = (n * sumXY - sumX * sumY) / denom
+            val intercept = (sumY - slope * sumX) / n
+            if (slope > 0.0) {
+                period = slope
+                t0 = intercept
+            }
+        }
+        return period to t0
+    }
+
+    /** Numera los golpes dentro del compás a partir de las marcas de primer tiempo. */
+    private fun numberBeats(n: Int, isDown: BooleanArray, meter: Int): IntArray {
+        val out = IntArray(n)
+        val first = isDown.indexOfFirst { it }
+        if (first < 0) {
+            for (i in 0 until n) out[i] = i % meter + 1
+            return out
+        }
+        out[first] = 1
+        for (i in first + 1 until n) out[i] = if (isDown[i]) 1 else out[i - 1] % meter + 1
+        for (i in first - 1 downTo 0) out[i] = if (out[i + 1] == 1) meter else out[i + 1] - 1
+        return out
+    }
+
+    private fun estimateBeatsPerBar(isDown: BooleanArray): Int {
+        val idx = isDown.indices.filter { isDown[it] }
+        if (idx.size < 2) return 4
+        val diffs = IntArray(idx.size - 1) { idx[it + 1] - idx[it] }.sortedArray()
+        return diffs[diffs.size / 2].coerceIn(2, 12)
     }
 
     private fun sigmoid(x: Float): Float = (1.0 / (1.0 + exp(-x.toDouble()))).toFloat()
@@ -176,13 +303,6 @@ object BeatTracker {
             k = j + 1
         }
         return merged.toDoubleArray()
-    }
-
-    private fun estimateBpm(beats: DoubleArray): Double {
-        if (beats.size < 3) return 0.0
-        val intervals = DoubleArray(beats.size - 1) { abs(beats[it + 1] - beats[it]) }.sortedArray()
-        val median = intervals[intervals.size / 2]
-        return if (median > 0) 60.0 / median else 0.0
     }
 
     private fun toMono22k(audio: DecodedAudio): FloatArray {
