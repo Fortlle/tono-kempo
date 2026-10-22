@@ -29,7 +29,8 @@ class MixSettings(
     val gains: FloatArray,
     val startMs: Long,
     val endMs: Long,
-    val click: ClickSpec?
+    val click: ClickSpec?,
+    val master: Float = 1f
 )
 
 object StemMixer {
@@ -131,6 +132,7 @@ object StemMixer {
             }
         }
 
+        Finisher.applyGain(out, s.master)
         s.click?.let { if (it.gain > 0f) Finisher.addClicks(out, SR, 2, startFrame, frames, it) }
         return out
     }

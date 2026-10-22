@@ -11,10 +11,13 @@ import android.provider.OpenableColumns
 import android.text.Editable
 import android.text.InputType
 import android.text.TextWatcher
+import android.transition.TransitionManager
+import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -43,6 +46,7 @@ class Rendered(val pcm: ByteArray, val sampleRate: Int, val channels: Int, val r
 /** Ajustes de salida ya expresados en el tiempo del audio resultante (después de cambiar la velocidad). */
 class OutSettings(
     val gains: FloatArray,
+    val master: Float,
     val startMs: Long,
     val endMs: Long,
     val click: ClickSpec?,
@@ -58,6 +62,17 @@ class MainActivity : AppCompatActivity() {
         const val TIME_EMPTY = -1L
         const val TIME_INVALID = -2L
         const val PREVIEW_MS = 15_000L
+    }
+
+    /** Sección que se puede plegar o desplegar. */
+    private class Section(
+        val container: LinearLayout,
+        val content: LinearLayout,
+        val arrow: ImageView,
+        val summary: TextView?,
+        val summaryFn: (() -> String)?
+    ) {
+        var expanded = false
     }
 
     private val ui = Handler(Looper.getMainLooper())
@@ -87,6 +102,7 @@ class MainActivity : AppCompatActivity() {
     private var accentShift = 0    // cuántos golpes se mueve el acento
 
     // Vistas
+    private lateinit var rootLayout: LinearLayout
     private lateinit var btnOpen: MaterialButton
     private lateinit var txtFile: TextView
     private lateinit var txtTone: TextView
@@ -96,6 +112,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var modelBanner: LinearLayout
     private lateinit var btnModel: MaterialButton
     private lateinit var btnImport: MaterialButton
+    private lateinit var sliderMaster: Slider
     private lateinit var volSliders: List<Slider>
     private lateinit var editStart: TextInputEditText
     private lateinit var editEnd: TextInputEditText
@@ -122,6 +139,11 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnCancel: MaterialButton
     private lateinit var progress: LinearProgressIndicator
     private lateinit var txtStatus: TextView
+
+    private lateinit var secQuality: Section
+    private lateinit var secRange: Section
+    private lateinit var secTempo: Section
+    private val sections = ArrayList<Section>()
 
     private val stemsOnly = ArrayList<View>()
     private val wholeOnly = ArrayList<View>()
@@ -169,7 +191,7 @@ class MainActivity : AppCompatActivity() {
     private fun stemsDir() = File(cacheDir, "stems")
 
     // =====================================================================
-    // Interfaz
+    // Interfaz: bloques básicos
     // =====================================================================
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
@@ -192,10 +214,14 @@ class MainActivity : AppCompatActivity() {
         it.setTextColor(themeColor(it, MR.attr.colorOnSurfaceVariant))
     }
 
-    private fun card(title: String?, body: LinearLayout.() -> Unit): MaterialCardView {
-        val card = MaterialCardView(this, null, MR.attr.materialCardViewOutlinedStyle).apply {
+    private fun outlinedCard(): MaterialCardView =
+        MaterialCardView(this, null, MR.attr.materialCardViewOutlinedStyle).apply {
             radius = dp(16).toFloat()
         }
+
+    /** Tarjeta fija (siempre abierta). */
+    private fun card(title: String?, body: LinearLayout.() -> Unit): MaterialCardView {
+        val card = outlinedCard()
         val inner = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(14), dp(16), dp(16))
@@ -204,6 +230,97 @@ class MainActivity : AppCompatActivity() {
         inner.body()
         card.addView(inner)
         return card
+    }
+
+    /**
+     * Sección con encabezado que se toca para plegar o desplegar. Si hay [summaryFn], el encabezado
+     * muestra ese resumen mientras la sección está plegada.
+     */
+    private fun section(
+        title: String,
+        expanded: Boolean,
+        appearance: Int,
+        summaryFn: (() -> String)?,
+        body: LinearLayout.() -> Unit
+    ): Section {
+        val container = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            isClickable = true
+            isFocusable = true
+            setPadding(0, dp(6), 0, dp(6))
+        }
+        val tv = TypedValue()
+        if (theme.resolveAttribute(android.R.attr.selectableItemBackground, tv, true)) {
+            header.setBackgroundResource(tv.resourceId)
+        }
+
+        val titles = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        titles.addView(text(title, appearance))
+        val summaryView = if (summaryFn != null) muted("") else null
+        summaryView?.let { titles.addView(it) }
+        header.addView(titles, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+
+        val arrow = ImageView(this).apply {
+            setImageResource(R.drawable.ic_expand_more)
+            imageTintList = ColorStateList.valueOf(themeColor(this, MR.attr.colorOnSurfaceVariant))
+            contentDescription = "Mostrar u ocultar"
+        }
+        header.addView(arrow, LinearLayout.LayoutParams(dp(24), dp(24)))
+
+        val content = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        content.body()
+
+        container.addView(header)
+        container.addView(content)
+
+        val sec = Section(container, content, arrow, summaryView, summaryFn)
+        sec.expanded = expanded
+        applyExpanded(sec)
+        header.setOnClickListener { setExpanded(sec, !sec.expanded, true) }
+        sections.add(sec)
+        return sec
+    }
+
+    private fun collapsibleCard(
+        title: String,
+        expanded: Boolean,
+        summaryFn: (() -> String)?,
+        body: LinearLayout.() -> Unit
+    ): Pair<MaterialCardView, Section> {
+        val card = outlinedCard()
+        val pad = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(8), dp(16), dp(12))
+        }
+        val sec = section(title, expanded, MR.style.TextAppearance_Material3_TitleMedium, summaryFn, body)
+        pad.addView(sec.container)
+        card.addView(pad)
+        return card to sec
+    }
+
+    private fun applyExpanded(sec: Section) {
+        sec.content.visibility = if (sec.expanded) View.VISIBLE else View.GONE
+        sec.arrow.rotation = if (sec.expanded) 180f else 0f
+        sec.summary?.visibility = if (sec.expanded) View.GONE else View.VISIBLE
+    }
+
+    private fun setExpanded(sec: Section, value: Boolean, animate: Boolean) {
+        if (animate && ::rootLayout.isInitialized) TransitionManager.beginDelayedTransition(rootLayout)
+        sec.expanded = value
+        applyExpanded(sec)
+        updateSummary(sec)
+    }
+
+    private fun updateSummary(sec: Section) {
+        sec.summary?.text = sec.summaryFn?.invoke() ?: ""
+    }
+
+    private fun updateSummaries() {
+        if (!::txtStatus.isInitialized) return // la pantalla aún se está armando
+        sections.forEach { updateSummary(it) }
     }
 
     private fun stateList(enabled: Int, disabled: Int) = ColorStateList(
@@ -279,7 +396,16 @@ class MainActivity : AppCompatActivity() {
             this.value = value
             isTickVisible = false
             setLabelFormatter(LabelFormatter { v -> format(v) })
+            addOnChangeListener { _, _, _ -> updateSummaries() }
         }
+
+    private fun watch(edit: TextInputEditText, action: () -> Unit) {
+        edit.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+            override fun afterTextChanged(s: Editable?) { action() }
+        })
+    }
 
     private fun timeField(hint: String, placeholder: String): Pair<TextInputLayout, TextInputEditText> {
         val layout = TextInputLayout(this, null, MR.attr.textInputOutlinedStyle).apply {
@@ -289,6 +415,7 @@ class MainActivity : AppCompatActivity() {
         val edit = TextInputEditText(layout.context).apply {
             inputType = InputType.TYPE_CLASS_DATETIME or InputType.TYPE_DATETIME_VARIATION_TIME
         }
+        watch(edit) { updateSummaries() }
         layout.addView(edit)
         return layout to edit
     }
@@ -315,19 +442,23 @@ class MainActivity : AppCompatActivity() {
             })
         }
         box.addView(row, lp(6))
-        edit.addTextChangedListener(object : TextWatcher {
-            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
-            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
-            override fun afterTextChanged(s: Editable?) { updateRatioText() }
-        })
+        watch(edit) {
+            updateRatioText()
+            updateSummaries()
+        }
         return box to edit
     }
+
+    // =====================================================================
+    // Interfaz: pantalla completa
+    // =====================================================================
 
     private fun buildUi(): View {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(20), dp(16), dp(32))
         }
+        rootLayout = root
 
         root.addView(text("Tono Kempo", MR.style.TextAppearance_Material3_HeadlineMedium))
         root.addView(muted("Cambia el tono y la velocidad de una canción, con metrónomo opcional"))
@@ -363,8 +494,8 @@ class MainActivity : AppCompatActivity() {
             addView(row, lp(8))
         }, lp(12))
 
-        // ---- Calidad ----
-        root.addView(card("Calidad") {
+        // ---- Calidad (plegada) ----
+        val (qCard, qSec) = collapsibleCard("Calidad", false, { qualitySummary() }) {
             addView(toggle(listOf("Pistas (mejor)", "Completa (rápida)"), 0) { idx ->
                 stemsMode = idx == 0
                 updateModeUi()
@@ -374,7 +505,7 @@ class MainActivity : AppCompatActivity() {
             val noteStems = muted(
                 "Separa voz, batería, bajo y otros, cambia cada pista por separado y las vuelve a unir. " +
                     "Tarda más, pero suena mucho mejor en canciones completas. " +
-                    "Si no cambias tono, velocidad ni volúmenes, no separa nada."
+                    "Si no cambias tono, velocidad ni volúmenes por pista, no separa nada."
             )
             addView(noteStems, lp(8))
             stemsOnly.add(noteStems)
@@ -383,18 +514,25 @@ class MainActivity : AppCompatActivity() {
             addView(noteWhole, lp(8))
             wholeOnly.add(noteWhole)
 
-            val engineToggle = toggle(listOf("Rubber Band", "Kempo"), 0) { idx -> engineKempo = idx == 1 }
+            val engineToggle = toggle(listOf("Rubber Band", "Kempo"), 0) { idx ->
+                engineKempo = idx == 1
+                updateSummaries()
+            }
             addView(engineToggle, lp(8))
             wholeOnly.add(engineToggle)
 
             switchPreserve = MaterialSwitch(this@MainActivity).apply {
                 text = "Conservar el timbre natural"
                 isChecked = true
+                setOnCheckedChangeListener { _, _ -> updateSummaries() }
             }
             addView(switchPreserve, lp(12))
             addView(muted("Recomendado. Apagado, la voz suena más grave o más aguda según el tono, como en una cinta acelerada."))
 
-            switchDrums = MaterialSwitch(this@MainActivity).apply { text = "Transponer también la batería" }
+            switchDrums = MaterialSwitch(this@MainActivity).apply {
+                text = "Transponer también la batería"
+                setOnCheckedChangeListener { _, _ -> updateSummaries() }
+            }
             addView(switchDrums, lp(12))
             stemsOnly.add(switchDrums)
 
@@ -408,27 +546,50 @@ class MainActivity : AppCompatActivity() {
             btnImport = outlinedButton("Importar desde un archivo .onnx") { pickModelFile() }
             modelBanner.addView(btnImport, lp(4))
             addView(modelBanner)
-        }, lp(12))
+        }
+        secQuality = qSec
+        root.addView(qCard, lp(12))
 
-        // ---- Mezcla ----
-        root.addView(card("Mezcla") {
-            addView(muted("Se aplica al escuchar y al guardar."), lp(2))
+        // ---- Volumen (plegado) ----
+        val (vCard, _) = collapsibleCard("Volumen", false, { volumeSummary() }) {
+            addView(muted("Se aplica al escuchar y al guardar. Por encima de 100 % se suaviza el pico para evitar distorsión."), lp(4))
+
+            val masterRow = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            masterRow.addView(
+                text("General", MR.style.TextAppearance_Material3_BodyMedium),
+                LinearLayout.LayoutParams(dp(72), ViewGroup.LayoutParams.WRAP_CONTENT)
+            )
+            sliderMaster = slider(0f, 200f, 5f, 100f) { "${it.toInt()}%" }
+            masterRow.addView(sliderMaster, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(masterRow, lp(4))
+
+            val stemTitle = muted("Por pista (necesita separar las pistas)")
+            addView(stemTitle, lp(12))
+            stemsOnly.add(stemTitle)
+
             volSliders = listOf("Voz", "Batería", "Bajo", "Otros").map { name ->
                 val row = LinearLayout(this@MainActivity).apply {
                     orientation = LinearLayout.HORIZONTAL
                     gravity = Gravity.CENTER_VERTICAL
                 }
-                val label = text(name, MR.style.TextAppearance_Material3_BodyMedium)
-                row.addView(label, LinearLayout.LayoutParams(dp(72), ViewGroup.LayoutParams.WRAP_CONTENT))
+                row.addView(
+                    text(name, MR.style.TextAppearance_Material3_BodyMedium),
+                    LinearLayout.LayoutParams(dp(72), ViewGroup.LayoutParams.WRAP_CONTENT)
+                )
                 val s = slider(0f, 200f, 5f, 100f) { "${it.toInt()}%" }
                 row.addView(s, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
                 addView(row, lp(2))
+                stemsOnly.add(row)
                 s
             }
-        }.also { stemsOnly.add(it) }, lp(12))
+        }
+        root.addView(vCard, lp(12))
 
-        // ---- Fragmento ----
-        root.addView(card("Fragmento") {
+        // ---- Fragmento (plegado) ----
+        val (rCard, rSec) = collapsibleCard("Fragmento", false, { rangeSummary() }) {
             val row = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.HORIZONTAL }
             val (startLayout, startEdit) = timeField("Inicio", "0:00")
             val (endLayout, endEdit) = timeField("Fin", "final")
@@ -442,13 +603,15 @@ class MainActivity : AppCompatActivity() {
                 muted("Minutos:segundos de la canción original, por ejemplo 1:20 y 3:04. Vacío = toda la canción."),
                 lp(6)
             )
-        }, lp(12))
+        }
+        secRange = rSec
+        root.addView(rCard, lp(12))
 
-        // ---- Tempo y metrónomo ----
-        root.addView(card("Tempo y metrónomo") {
+        // ---- Tempo y metrónomo (plegado) ----
+        val (tCard, tSec) = collapsibleCard("Tempo y metrónomo", false, { tempoSummary() }) {
             addView(
                 muted("Detecta el tempo para cambiar la velocidad de la canción o agregar un metrónomo. No necesita separar pistas."),
-                lp(2)
+                lp(6)
             )
             btnTempo = filled("Detectar tempo") { detectTempo() }
             addView(btnTempo, lp(10))
@@ -457,21 +620,10 @@ class MainActivity : AppCompatActivity() {
 
             tempoPanel = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
 
-            // Método de detección
-            tempoPanel.addView(text("Detección", MR.style.TextAppearance_Material3_LabelLarge), lp(14))
-            tempoPanel.addView(toggle(listOf("Picos", "Estable"), 0) { idx ->
-                useDbn = idx == 1
-                redecodeBeats()
-            }, lp(6))
-            tempoPanel.addView(
-                muted("«Picos» usa los golpes tal cual los marca el modelo. «Estable» fuerza un pulso regular y puede ayudar con canciones muy parejas. Prueba las dos."),
-                lp(4)
-            )
-
             // Tempo original
             tempoPanel.addView(
                 text("Tempo original (corrígelo si la detección se equivocó)", MR.style.TextAppearance_Material3_LabelLarge),
-                lp(16)
+                lp(14)
             )
             val (origBox, origEdit) = bpmStepper(
                 "BPM originales",
@@ -485,10 +637,29 @@ class MainActivity : AppCompatActivity() {
             editBpmOrig = origEdit
             tempoPanel.addView(origBox)
 
+            // Método de detección (plegado)
+            val detSec = section(
+                "Método de detección",
+                false,
+                MR.style.TextAppearance_Material3_LabelLarge,
+                { if (useDbn) "Estable" else "Picos" }
+            ) {
+                addView(toggle(listOf("Picos", "Estable"), 0) { idx ->
+                    useDbn = idx == 1
+                    updateSummaries()
+                    redecodeBeats()
+                }, lp(6))
+                addView(
+                    muted("«Picos» usa los golpes tal cual los marca el modelo. «Estable» fuerza un pulso regular y puede ayudar con canciones muy parejas. Prueba las dos."),
+                    lp(4)
+                )
+            }
+            tempoPanel.addView(detSec.container, lp(8))
+
             // Cambiar la velocidad
             switchStretch = MaterialSwitch(this@MainActivity).apply { text = "Cambiar la velocidad de la canción" }
             switchStretch.setOnCheckedChangeListener { _, _ -> updateTempoPanel() }
-            tempoPanel.addView(switchStretch, lp(16))
+            tempoPanel.addView(switchStretch, lp(14))
 
             stretchPanel = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
             stretchPanel.addView(
@@ -516,7 +687,7 @@ class MainActivity : AppCompatActivity() {
             // Metrónomo
             switchClick = MaterialSwitch(this@MainActivity).apply { text = "Agregar metrónomo" }
             switchClick.setOnCheckedChangeListener { _, _ -> updateTempoPanel() }
-            tempoPanel.addView(switchClick, lp(16))
+            tempoPanel.addView(switchClick, lp(14))
 
             clickPanel = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
             clickPanel.addView(text("Cómo suena", MR.style.TextAppearance_Material3_LabelLarge), lp(6))
@@ -528,42 +699,54 @@ class MainActivity : AppCompatActivity() {
                 lp(6)
             )
 
-            clickPanel.addView(text("Compás", MR.style.TextAppearance_Material3_LabelLarge), lp(14))
-            clickPanel.addView(toggle(listOf("Auto", "2", "3", "4", "6"), 0) { idx ->
-                barChoice = intArrayOf(0, 2, 3, 4, 6)[idx]
-                redecodeBeats()
-            }, lp(6))
-
-            clickPanel.addView(
-                text("Si el acento (el clic más agudo) cae en el golpe equivocado, muévelo", MR.style.TextAppearance_Material3_LabelLarge),
-                lp(14)
-            )
-            val shiftRow = LinearLayout(this@MainActivity).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER
-            }
-            txtShift = text("0", MR.style.TextAppearance_Material3_TitleMedium)
-            txtShift.gravity = Gravity.CENTER
-            shiftRow.addView(iconOnly(R.drawable.ic_chevron_left, "Mover el acento antes") { shiftAccent(-1) })
-            shiftRow.addView(txtShift, LinearLayout.LayoutParams(dp(72), ViewGroup.LayoutParams.WRAP_CONTENT))
-            shiftRow.addView(iconOnly(R.drawable.ic_chevron_right, "Mover el acento después") { shiftAccent(1) })
-            clickPanel.addView(shiftRow, lp(6))
-
             clickPanel.addView(text("Volumen del metrónomo", MR.style.TextAppearance_Material3_LabelLarge), lp(14))
-            sliderClick = slider(0f, 100f, 5f, 60f) { "${it.toInt()}%" }
+            sliderClick = slider(0f, 200f, 5f, 100f) { "${it.toInt()}%" }
             clickPanel.addView(sliderClick)
 
-            clickPanel.addView(text("Adelantar o atrasar el metrónomo (milisegundos)", MR.style.TextAppearance_Material3_LabelLarge), lp(14))
-            sliderPhase = slider(-200f, 200f, 5f, 0f) { String.format(Locale.US, "%+d ms", it.toInt()) }
-            clickPanel.addView(sliderPhase)
-            clickPanel.addView(muted("Negativo = los clics suenan antes; positivo = después."), lp(2))
+            // Acento y sincronía (plegado)
+            val accSec = section(
+                "Acento y sincronía",
+                false,
+                MR.style.TextAppearance_Material3_LabelLarge,
+                { accentSummary() }
+            ) {
+                addView(text("Compás", MR.style.TextAppearance_Material3_LabelLarge), lp(8))
+                addView(toggle(listOf("Auto", "2", "3", "4", "6"), 0) { idx ->
+                    barChoice = intArrayOf(0, 2, 3, 4, 6)[idx]
+                    updateSummaries()
+                    redecodeBeats()
+                }, lp(6))
+
+                addView(
+                    text("Si el acento (el clic más agudo) cae en el golpe equivocado, muévelo", MR.style.TextAppearance_Material3_LabelLarge),
+                    lp(14)
+                )
+                val shiftRow = LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER
+                }
+                txtShift = text("0", MR.style.TextAppearance_Material3_TitleMedium)
+                txtShift.gravity = Gravity.CENTER
+                shiftRow.addView(iconOnly(R.drawable.ic_chevron_left, "Mover el acento antes") { shiftAccent(-1) })
+                shiftRow.addView(txtShift, LinearLayout.LayoutParams(dp(72), ViewGroup.LayoutParams.WRAP_CONTENT))
+                shiftRow.addView(iconOnly(R.drawable.ic_chevron_right, "Mover el acento después") { shiftAccent(1) })
+                addView(shiftRow, lp(6))
+
+                addView(text("Adelantar o atrasar el metrónomo (milisegundos)", MR.style.TextAppearance_Material3_LabelLarge), lp(14))
+                sliderPhase = slider(-200f, 200f, 5f, 0f) { String.format(Locale.US, "%+d ms", it.toInt()) }
+                addView(sliderPhase)
+                addView(muted("Negativo = los clics suenan antes; positivo = después."), lp(2))
+            }
+            clickPanel.addView(accSec.container, lp(10))
             tempoPanel.addView(clickPanel)
 
             btnPreview = tonalButton("Escuchar 15 segundos") { applyAndPlay(PREVIEW_MS) }
             tempoPanel.addView(btnPreview, lp(14))
 
             addView(tempoPanel)
-        }, lp(12))
+        }
+        secTempo = tSec
+        root.addView(tCard, lp(12))
 
         // ---- Reproducir y guardar ----
         root.addView(card("Escuchar y guardar") {
@@ -629,6 +812,60 @@ class MainActivity : AppCompatActivity() {
     }
 
     // =====================================================================
+    // Resúmenes que se ven con las secciones plegadas
+    // =====================================================================
+
+    private fun qualitySummary(): String {
+        val parts = ArrayList<String>()
+        parts.add(
+            if (stemsMode) "Pistas"
+            else if (engineKempo) "Completa · Kempo"
+            else "Completa · Rubber Band"
+        )
+        parts.add(if (switchPreserve.isChecked) "timbre natural" else "timbre movido")
+        if (stemsMode && switchDrums.isChecked) parts.add("batería transpuesta")
+        return parts.joinToString(" · ")
+    }
+
+    private fun volumeSummary(): String {
+        val names = listOf("Voz", "Batería", "Bajo", "Otros")
+        val parts = ArrayList<String>()
+        parts.add("General ${sliderMaster.value.toInt()}%")
+        if (stemsMode) {
+            for (i in volSliders.indices) {
+                val v = volSliders[i].value.toInt()
+                if (v != 100) parts.add("${names[i]} $v%")
+            }
+        }
+        return parts.joinToString(" · ")
+    }
+
+    private fun rangeSummary(): String {
+        val s = editStart.text?.toString()?.trim().orEmpty()
+        val e = editEnd.text?.toString()?.trim().orEmpty()
+        return if (s.isEmpty() && e.isEmpty()) "Toda la canción"
+        else "${s.ifEmpty { "0:00" }} → ${e.ifEmpty { "final" }}"
+    }
+
+    private fun tempoSummary(): String {
+        val an = beatAnalysis ?: return "Sin detectar"
+        if (an.beats.isEmpty()) return "Sin resultado"
+        val orig = parseBpm(editBpmOrig) ?: an.bpm
+        val sb = StringBuilder(String.format(Locale.US, "%.2f BPM", orig))
+        if (switchStretch.isChecked) {
+            parseBpm(editBpmNew)?.let { sb.append(String.format(Locale.US, " → %.2f", it)) }
+        }
+        if (switchClick.isChecked) sb.append(" · metrónomo")
+        return sb.toString()
+    }
+
+    private fun accentSummary(): String {
+        val bar = if (barChoice == 0) "auto" else barChoice.toString()
+        val shift = if (accentShift > 0) "+$accentShift" else accentShift.toString()
+        return "Compás $bar · acento $shift · ${sliderPhase.value.toInt()} ms"
+    }
+
+    // =====================================================================
     // Estado de la interfaz
     // =====================================================================
 
@@ -643,6 +880,9 @@ class MainActivity : AppCompatActivity() {
         stemsOnly.forEach { it.visibility = if (stemsMode) View.VISIBLE else View.GONE }
         wholeOnly.forEach { it.visibility = if (stemsMode) View.GONE else View.VISIBLE }
         modelBanner.visibility = if (needModel) View.VISIBLE else View.GONE
+        // Si falta el modelo, se abre la sección donde está el botón para descargarlo
+        if (needModel && !secQuality.expanded) setExpanded(secQuality, true, false)
+        updateSummaries()
     }
 
     private fun updateTempoPanel() {
@@ -651,10 +891,11 @@ class MainActivity : AppCompatActivity() {
         stretchPanel.visibility = if (switchStretch.isChecked) View.VISIBLE else View.GONE
         clickPanel.visibility = if (switchClick.isChecked) View.VISIBLE else View.GONE
         updateRatioText()
+        updateSummaries()
     }
 
     private fun updateRatioText() {
-        if (!::txtRatio.isInitialized) return
+        if (!::txtRatio.isInitialized || !::editBpmNew.isInitialized) return
         val o = parseBpm(editBpmOrig)
         val n = parseBpm(editBpmNew)
         if (o == null || n == null) {
@@ -687,6 +928,7 @@ class MainActivity : AppCompatActivity() {
         btnPause.text = if (player.isPaused) "Reanudar" else "Pausa"
         btnPause.setIconResource(if (player.isPaused) R.drawable.ic_play else R.drawable.ic_pause)
         btnCancel.visibility = if (busy && cancellable) View.VISIBLE else View.GONE
+        updateSummaries()
     }
 
     private fun setBusy(value: Boolean, status: String, canCancel: Boolean = false) {
@@ -757,6 +999,7 @@ class MainActivity : AppCompatActivity() {
     private fun shiftAccent(d: Int) {
         accentShift += d
         txtShift.text = if (accentShift > 0) "+$accentShift" else accentShift.toString()
+        updateSummaries()
     }
 
     // =====================================================================
@@ -1041,16 +1284,19 @@ class MainActivity : AppCompatActivity() {
         val s = parseTimeMs(editStart.text.toString())
         val e = parseTimeMs(editEnd.text.toString())
         if (s == TIME_INVALID || e == TIME_INVALID) {
+            setExpanded(secRange, true, true)
             setStatus("Tiempo no válido. Usa minutos:segundos, por ejemplo 1:20.")
             return null
         }
         val startOrig = if (s == TIME_EMPTY) 0L else s
         val endOrig = if (e == TIME_EMPTY) -1L else e
         if (endOrig in 0..startOrig) {
+            setExpanded(secRange, true, true)
             setStatus("El fin debe ser mayor que el inicio.")
             return null
         }
         if (startOrig >= a.durationMs) {
+            setExpanded(secRange, true, true)
             setStatus("El inicio está después del final de la canción.")
             return null
         }
@@ -1061,10 +1307,12 @@ class MainActivity : AppCompatActivity() {
             endOut = if (endOut < 0) cap else min(endOut, cap)
         }
         // Orden interno: batería, bajo, otros, voz. En pantalla: voz, batería, bajo, otros.
-        val v = volSliders.map { it.value / 100f }
+        // Las pistas solo cuentan en el modo de pistas.
+        val v = volSliders.map { if (stemsMode) it.value / 100f else 1f }
         val gains = floatArrayOf(v[1], v[2], v[3], v[0])
+        val master = sliderMaster.value / 100f
         val rangeKey = "${editStart.text.toString().trim()}|${editEnd.text.toString().trim()}|${previewMs ?: 0}"
-        return OutSettings(gains, startOut, endOut, buildClick(a, ratio), rangeKey)
+        return OutSettings(gains, master, startOut, endOut, buildClick(a, ratio), rangeKey)
     }
 
     // =====================================================================
@@ -1077,6 +1325,7 @@ class MainActivity : AppCompatActivity() {
         val ratio = timeRatio()
         val out = buildOutSettings(a, ratio, previewMs) ?: return
 
+        // El volumen general no exige separar pistas; solo los volúmenes por pista
         val gainsDefault = out.gains.all { it == 1f }
         val nothingToChange = st == 0f && ratio == 1.0 && gainsDefault
 
@@ -1084,7 +1333,7 @@ class MainActivity : AppCompatActivity() {
         else processWhole(a, st, ratio, out, nothingToChange, then)
     }
 
-    /** Procesa la canción entera (o la deja igual) y después recorta y agrega el metrónomo. */
+    /** Procesa la canción entera (o la deja igual) y después recorta, sube o baja el volumen y agrega el metrónomo. */
     private fun processWhole(
         a: DecodedAudio,
         st: Float,
@@ -1097,15 +1346,17 @@ class MainActivity : AppCompatActivity() {
         val eng = if (ratio != 1.0 || !engineKempo) Engine.RUBBERBAND else Engine.KEMPO
         val key = if (untouched) "orig" else "whole|$st|$moveFormants|$eng|$ratio"
 
-        fun finish(base: Rendered) {
-            val pcm = Finisher.cropAndClick(base.pcm, base.sampleRate, base.channels, out.startMs, out.endMs, out.click)
-            then(Rendered(pcm, base.sampleRate, base.channels, out.rangeKey))
+        fun finish(base: Rendered): Rendered {
+            val pcm = Finisher.cropAndClick(
+                base.pcm, base.sampleRate, base.channels, out.startMs, out.endMs, out.master, out.click
+            )
+            return Rendered(pcm, base.sampleRate, base.channels, out.rangeKey)
         }
 
         val cached = baseRendered
         if (key == baseKey && cached != null) {
             try {
-                finish(cached)
+                then(finish(cached))
             } catch (e: Throwable) {
                 setStatus("Error: ${e.message ?: e.javaClass.simpleName}")
             }
@@ -1120,12 +1371,12 @@ class MainActivity : AppCompatActivity() {
                     ui.post { setStatus("Procesando con $engineName… ${(p * 100).toInt()}%", p) }
                 }
                 val base = Rendered(pcm, a.sampleRate, a.channels)
-                val result = Finisher.cropAndClick(base.pcm, base.sampleRate, base.channels, out.startMs, out.endMs, out.click)
+                val result = finish(base)
                 ui.post {
                     baseKey = key
                     baseRendered = base
                     setBusy(false, "Listo")
-                    then(Rendered(result, base.sampleRate, base.channels, out.rangeKey))
+                    then(result)
                 }
             } catch (e: Throwable) {
                 ui.post { setBusy(false, "Error al procesar: ${e.message ?: e.javaClass.simpleName}") }
@@ -1141,6 +1392,7 @@ class MainActivity : AppCompatActivity() {
         then: (Rendered) -> Unit
     ) {
         if (!StemSeparator.hasModel(this)) {
+            setExpanded(secQuality, true, true)
             setStatus("Falta el modelo de separación. Usa el botón Descargar modelo.")
             updateModeUi()
             return
@@ -1148,7 +1400,7 @@ class MainActivity : AppCompatActivity() {
         val moveFormants = !switchPreserve.isChecked
         val drums = switchDrums.isChecked
         val key = "$st|$moveFormants|$drums|$ratio"
-        val settings = MixSettings(out.gains, out.startMs, out.endMs, out.click)
+        val settings = MixSettings(out.gains, out.startMs, out.endMs, out.click, out.master)
 
         cancelFlag.set(false)
         setBusy(true, "Preparando…", canCancel = true)
