@@ -20,10 +20,10 @@ import kotlin.math.sin
 
 /**
  * Resultado de la detección.
- * [beats]: tiempo de cada golpe en segundos. [beatInBar]: número de cada golpe dentro del compás (1 = primer tiempo).
- * [bpm]: tempo ajustado por mínimos cuadrados sobre todos los golpes (más preciso que el de un solo intervalo).
- * [gridT0]: tiempo de un primer tiempo sobre la rejilla ajustada, para generar un pulso fijo alineado.
- * [beatProb]/[downProb]: probabilidades del modelo, para recalcular sin volver a correrlo.
+ * [bpm]: tempo de la rejilla ajustada a las probabilidades del modelo en toda la canción.
+ * [beatT0]: tiempo (s) de un golpe de esa rejilla. [gridT0]: tiempo (s) del golpe que parece ser el 1 del compás.
+ * [beats]/[beatInBar]: golpes sueltos que marca el modelo (solo informativos).
+ * [beatProb]/[downProb]: probabilidades del modelo por frame de 20 ms.
  */
 class BeatAnalysis(
     val beats: DoubleArray,
@@ -31,6 +31,7 @@ class BeatAnalysis(
     val bpm: Double,
     val meter: Int,
     val gridT0: Double,
+    val beatT0: Double,
     val beatProb: FloatArray,
     val downProb: FloatArray
 )
@@ -147,7 +148,7 @@ object BeatTracker {
             val r = DbnTracker.decode(beatProb, downProb, meters)
             if (r != null && r.frames.size >= 2) {
                 val beats = DoubleArray(r.frames.size) { r.frames[it] / FPS }
-                return assemble(beats, r.numbers, r.meter, beatProb, downProb)
+                return assemble(beats, r.numbers, meters, beatProb, downProb)
             }
         }
 
@@ -173,28 +174,140 @@ object BeatTracker {
             val est = estimateBeatsPerBar(isDown)
             meters.minByOrNull { abs(it - est) } ?: 4
         }
-        return assemble(beats, numberBeats(beats.size, isDown, meter), meter, beatProb, downProb)
+        return assemble(beats, numberBeats(beats.size, isDown, meter), meters, beatProb, downProb)
     }
 
     private fun assemble(
         beats: DoubleArray,
         numbers: IntArray,
-        meter: Int,
+        meters: IntArray,
         beatProb: FloatArray,
         downProb: FloatArray
     ): BeatAnalysis {
-        val grid = fitGrid(beats)
-        val period = grid?.first ?: (if (beats.size >= 3) medianInterval(beats) else 0.0)
-        val bpm = if (period > 0) 60.0 / period else 0.0
-
-        // Referencia de la rejilla: un primer tiempo (si hay) sobre la línea ajustada
-        var t0 = beats.firstOrNull() ?: 0.0
-        if (grid != null && beats.isNotEmpty()) {
-            val firstDown = numbers.indexOfFirst { it == 1 }.let { if (it < 0) 0 else it }
-            val n = Math.round((beats[firstDown] - grid.second) / grid.first).toDouble()
-            t0 = grid.second + n * grid.first
+        val fit = fitGrid(beats)
+        val period0 = fit?.first ?: (if (beats.size >= 3) medianInterval(beats) else 0.0)
+        val defaultMeter = meters.firstOrNull() ?: 4
+        if (period0 <= 0.0) {
+            return BeatAnalysis(beats, numbers, 0.0, defaultMeter, 0.0, 0.0, beatProb, downProb)
         }
-        return BeatAnalysis(beats, numbers, bpm, meter, t0, beatProb, downProb)
+        val t0Guess = fit?.second ?: beats.firstOrNull() ?: 0.0
+
+        // Se afina la rejilla para que sus puntos caigan sobre los picos de actividad del modelo
+        val (bpm, beatT0) = refineGrid(beatProb, period0, t0Guess)
+        val (meter, downT0) = chooseMeterAndDownbeat(downProb, beatT0, 60.0 / bpm, meters)
+        return BeatAnalysis(beats, numbers, bpm, meter, downT0, beatT0, beatProb, downProb)
+    }
+
+    /** Vuelve a elegir el 1 del compás con otros tiempos por compás permitidos, sin repetir el modelo. */
+    fun realign(an: BeatAnalysis, meters: IntArray): BeatAnalysis {
+        if (an.bpm <= 0.0) return an
+        val (meter, downT0) = chooseMeterAndDownbeat(an.downProb, an.beatT0, 60.0 / an.bpm, meters)
+        return BeatAnalysis(an.beats, an.beatInBar, an.bpm, meter, downT0, an.beatT0, an.beatProb, an.downProb)
+    }
+
+    private fun probAt(p: FloatArray, t: Double): Double {
+        val x = t * FPS
+        val i = Math.floor(x).toInt()
+        if (i < 0 || i >= p.size - 1) return 0.0
+        val f = x - i
+        return p[i] * (1.0 - f) + p[i + 1] * f
+    }
+
+    private fun maxAround(p: FloatArray, t: Double, w: Int): Double {
+        val c = Math.round(t * FPS).toInt()
+        var m = 0f
+        for (i in (c - w)..(c + w)) if (i in p.indices && p[i] > m) m = p[i]
+        return m.toDouble()
+    }
+
+    private fun gridScore(p: FloatArray, t0: Double, step: Double, duration: Double): Double {
+        var s = 0.0
+        var t = t0
+        while (t < duration) {
+            s += probAt(p, t)
+            t += step
+        }
+        return s
+    }
+
+    /**
+     * Busca los BPM (cerca de [period0]) y la fase que hacen que una rejilla perfectamente regular
+     * pase por los picos de probabilidad de golpe en toda la canción. Es más robusto que fiarse de golpes sueltos.
+     */
+    private fun refineGrid(beatProb: FloatArray, period0: Double, t0Guess: Double): Pair<Double, Double> {
+        val duration = beatProb.size / FPS
+        val bpm0 = 60.0 / period0
+        var bestScore = -1.0
+        var bestBpm = bpm0
+        var bestT0 = ((t0Guess % period0) + period0) % period0
+
+        var bpm = bpm0 - 0.8
+        while (bpm <= bpm0 + 0.8) {
+            if (bpm > 20.0) {
+                val step = 60.0 / bpm
+                var d = 0.0
+                while (d < step) {
+                    val sc = gridScore(beatProb, d, step, duration)
+                    if (sc > bestScore) {
+                        bestScore = sc
+                        bestBpm = bpm
+                        bestT0 = d
+                    }
+                    d += 0.01
+                }
+            }
+            bpm += 0.02
+        }
+
+        // Afinado de la fase a 2 ms
+        val step = 60.0 / bestBpm
+        var d = bestT0 - 0.012
+        var bestD = bestT0
+        var bestSc = -1.0
+        while (d <= bestT0 + 0.012) {
+            val sc = gridScore(beatProb, ((d % step) + step) % step, step, duration)
+            if (sc > bestSc) {
+                bestSc = sc
+                bestD = d
+            }
+            d += 0.002
+        }
+        return bestBpm to (((bestD % step) + step) % step)
+    }
+
+    /**
+     * Entre los compases permitidos y las posiciones posibles del 1, elige el que concentra más probabilidad
+     * de primer tiempo a lo largo de toda la canción. Así hay un solo acento por compás, siempre en la misma posición.
+     */
+    private fun chooseMeterAndDownbeat(
+        down: FloatArray,
+        beatT0: Double,
+        period: Double,
+        meters: IntArray
+    ): Pair<Int, Double> {
+        val duration = down.size / FPS
+        var bestM = meters.firstOrNull() ?: 4
+        var bestT0 = beatT0
+        var bestAvg = -1.0
+        for (m in meters) {
+            for (j in 0 until m) {
+                var s = 0.0
+                var n = 0
+                var t = beatT0 + j * period
+                while (t < duration) {
+                    s += maxAround(down, t, 2)
+                    n++
+                    t += m * period
+                }
+                val avg = if (n > 0) s / n else 0.0
+                if (avg > bestAvg) {
+                    bestAvg = avg
+                    bestM = m
+                    bestT0 = beatT0 + j * period
+                }
+            }
+        }
+        return bestM to bestT0
     }
 
     private fun medianInterval(beats: DoubleArray): Double {
