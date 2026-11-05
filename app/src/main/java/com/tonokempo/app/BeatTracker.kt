@@ -205,6 +205,59 @@ object BeatTracker {
         return BeatAnalysis(an.beats, an.beatInBar, an.bpm, meter, downT0, an.beatT0, an.beatProb, an.downProb)
     }
 
+    /**
+     * Propone cambios de compás (por ejemplo de 3/4 a 4/4) mirando cada cuántos golpes de la rejilla aparece
+     * un primer tiempo. Devuelve (instante en s, tiempos por compás) para cada cambio. Es solo una sugerencia.
+     */
+    fun suggestMeterChanges(an: BeatAnalysis, bpm: Double, anchor: Double): List<Pair<Double, Int>> {
+        if (bpm <= 0.0) return emptyList()
+        val period = 60.0 / bpm
+        val duration = an.downProb.size / FPS
+
+        val times = ArrayList<Double>()
+        var k = -Math.floor(anchor / period).toInt()
+        while (true) {
+            val t = anchor + k * period
+            if (t >= duration) break
+            if (t >= 0.0) times.add(t)
+            k++
+        }
+        val n = times.size
+        if (n < 12) return emptyList()
+
+        val score = DoubleArray(n) { maxAround(an.downProb, times[it], 2) }
+        val cands = ArrayList<Int>()
+        for (i in 0 until n) {
+            val s = score[i]
+            if (s < 0.3) continue
+            val l = if (i > 0) score[i - 1] else 0.0
+            val r = if (i < n - 1) score[i + 1] else 0.0
+            if (s >= l && s >= r) cands.add(i)
+        }
+        if (cands.size < 4) return emptyList()
+
+        val lens = IntArray(cands.size - 1) { (cands[it + 1] - cands[it]).coerceIn(1, 12) }
+        val sm = IntArray(lens.size) { i ->
+            val a = lens[maxOf(0, i - 1)]
+            val b = lens[i]
+            val c = lens[minOf(lens.size - 1, i + 1)]
+            maxOf(minOf(a, b), minOf(maxOf(a, b), c))   // mediana de tres
+        }
+
+        val out = ArrayList<Pair<Double, Int>>()
+        var cur = sm[0]
+        for (i in 1 until sm.size) {
+            if (sm[i] != cur) {
+                val persists = i + 1 >= sm.size || sm[i + 1] == sm[i]
+                if (persists && sm[i] in 2..9) {
+                    out.add(times[cands[i]] to sm[i])
+                    cur = sm[i]
+                }
+            }
+        }
+        return out
+    }
+
     private fun probAt(p: FloatArray, t: Double): Double {
         val x = t * FPS
         val i = Math.floor(x).toInt()
